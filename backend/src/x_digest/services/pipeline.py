@@ -158,7 +158,7 @@ class PipelineService:
             )
             for group in groups:
                 first = group.posts[0]
-                conversation_id = first.conversation_id or first.id
+                conversation_id = first.conversation_id or by_id[first.id].platform_post_id
                 thread = session.scalar(
                     select(Thread).where(
                         Thread.conversation_id == conversation_id,

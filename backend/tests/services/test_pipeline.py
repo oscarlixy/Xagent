@@ -153,6 +153,19 @@ def test_multi_post_conversation_persists_one_thread_and_one_summary() -> None:
         assert len(summary.source_ids) == 2
 
 
+def test_standalone_thread_uses_portable_platform_post_id_fallback() -> None:
+    platform_post_id = "post-123456789012345678901234567"
+    session_factory, list_id, service = make_pipeline(posts=(raw_post(platform_post_id),))
+
+    asyncio.run(service.run_list_pipeline(list_id))
+
+    with session_factory() as session:
+        thread = session.scalar(select(Thread))
+        assert thread is not None
+        assert thread.conversation_id == platform_post_id
+        assert len(thread.conversation_id) <= 32
+
+
 def test_failed_summary_is_retried_without_losing_ingested_post() -> None:
     session_factory, list_id, service = make_pipeline(posts=(raw_post("101"),))
     service._summarizer = FailOnceSummarizer()  # type: ignore[assignment]
