@@ -1,13 +1,28 @@
 services:
   backend:
+    image: x-digest
     build:
       context: ./backend
     command: ["uvicorn", "x_digest.main:app", "--host", "0.0.0.0", "--port", "8000"]
     env_file:
       - path: ./backend/.env
         required: false
+    environment:
+      DATABASE_URL: sqlite+pysqlite:////data/x_digest.db
     expose:
       - "8000"
+    volumes:
+      - x_digest_data:/data
+  scheduler:
+    image: x-digest
+    build:
+      context: ./backend
+    command: ["python", "-m", "x_digest.scheduler"]
+    env_file:
+      - path: ./backend/.env
+        required: false
+    environment:
+      DATABASE_URL: sqlite+pysqlite:////data/x_digest.db
     volumes:
       - x_digest_data:/data
 
