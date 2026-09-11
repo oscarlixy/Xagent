@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy import create_engine, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from x_digest.api.jobs import JobService
 from x_digest.config import Settings
 from x_digest.main import create_app
 from x_digest.models import (
@@ -23,6 +27,7 @@ from x_digest.models import (
     XList,
 )
 from x_digest.services.pipeline import PipelineResult, StageResult
+from x_digest.services.summarization import DeterministicSummarizer
 
 TOKEN = "test-only-internal-api-token-0123456789abcdef"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
@@ -40,6 +45,26 @@ class FakePipeline:
 class FailingPipeline:
     async def run_list_pipeline(self, list_id: str) -> PipelineResult:
         raise RuntimeError(f"provider secret for {list_id}")
+
+
+class LeakyPipeline:
+    async def run_list_pipeline(self, list_id: str) -> PipelineResult:
+        return PipelineResult(
+            run_id=f"run-for-{list_id}",
+            status="partial",
+            stages={
+                "links": StageResult(
+                    counts={"failed": 1},
+                    duration_ms=1,
+                    last_error="provider-token-super-secret",
+                ),
+                "summary": StageResult(
+                    counts={"failed": 1},
+                    duration_ms=2,
+                    last_error="summary_processing_failed",
+                ),
+            },
+        )
 
 
 @pytest.fixture
@@ -206,6 +231,38 @@ def test_list_crud_validates_input_and_missing_resources(api) -> None:
         assert memberships == []
 
 
+def test_request_models_reject_type_coercion(api) -> None:
+    client, _factory, ids = api
+
+    numeric_string = client.post(
+        "/api/lists",
+        headers=AUTH,
+        json={
+            "platform_list_id": "strict-list-a",
+            "name": "Strict",
+            "sync_interval_minutes": "30",
+        },
+    )
+    integer_boolean = client.post(
+        "/api/lists",
+        headers=AUTH,
+        json={
+            "platform_list_id": "strict-list-b",
+            "name": "Strict",
+            "enabled": 1,
+        },
+    )
+    state_integer = client.post(
+        f"/api/posts/{ids['older']}/state",
+        headers=AUTH,
+        json={"read": 1},
+    )
+
+    assert numeric_string.status_code == 422
+    assert integer_boolean.status_code == 422
+    assert state_integer.status_code == 422
+
+
 def test_posts_use_stable_cursor_pagination_and_include_source_url(api) -> None:
     client, factory, ids = api
 
@@ -267,6 +324,20 @@ def test_posts_apply_combined_list_topic_author_time_and_state_filters(api) -> N
         "saved": True,
         "ignored": False,
     }
+
+
+def test_posts_reject_reversed_time_window(api) -> None:
+    client, _factory, _ids = api
+
+    response = client.get(
+        "/api/posts",
+        headers=AUTH,
+        params={"from": "2026-09-11T12:00:00Z", "to": "2026-09-11T10:00:00Z"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "invalid_time_window"
+    assert response.json()["message"] == "Start time must not be after end time"
 
 
 def test_post_state_mutation_is_idempotent_and_rejects_missing_post(api) -> None:
@@ -332,11 +403,140 @@ def test_summary_regeneration_requires_key_and_deduplicates(api) -> None:
     assert first.status_code == repeated.status_code == 201
     assert first.json() == repeated.json()
     assert first.json()["generation"] == 2
+    mismatched = client.post(
+        f"/api/posts/{ids['python']}/summaries/regenerate",
+        headers={**AUTH, "Idempotency-Key": "summary-request-1"},
+    )
+    assert mismatched.status_code == 409
+    assert mismatched.json()["code"] == "idempotency_key_reused"
     with factory() as session:
         rows = session.scalars(
             select(Summary).where(Summary.regeneration_request_id == "summary-request-1")
         ).all()
         assert len(rows) == 1
+
+
+def test_summary_regeneration_rebuilds_the_complete_multi_post_unit(api) -> None:
+    client, factory, ids = api
+    with factory.begin() as session:
+        session.add(
+            Summary(
+                content_fingerprint="multi-post-unit",
+                model="fake-summary-v1",
+                prompt_version="single-content-v1",
+                generation=5,
+                summary="Original thread summary",
+                key_points=["thread"],
+                topics=["ai"],
+                importance=4,
+                language="en",
+                source_ids=[ids["older"], ids["saved"]],
+            )
+        )
+
+    first = client.post(
+        f"/api/posts/{ids['older']}/summaries/regenerate",
+        headers={**AUTH, "Idempotency-Key": "multi-post-request-1"},
+    )
+    second = client.post(
+        f"/api/posts/{ids['saved']}/summaries/regenerate",
+        headers={**AUTH, "Idempotency-Key": "multi-post-request-2"},
+    )
+
+    assert first.status_code == 201
+    assert first.json()["source_ids"] == [ids["older"], ids["saved"]]
+    assert "Older AI post" in first.json()["summary"]
+    assert "Saved AI post" in first.json()["summary"]
+    assert first.json()["generation"] == 6
+    assert second.status_code == 201
+    assert second.json()["source_ids"] == [ids["older"], ids["saved"]]
+    assert second.json()["generation"] == 7
+
+
+def test_summary_regeneration_uses_latest_unit_not_highest_unrelated_generation(api) -> None:
+    client, factory, ids = api
+    with factory.begin() as session:
+        old_single = next(
+            summary
+            for summary in session.scalars(select(Summary)).all()
+            if summary.source_ids == [ids["saved"]]
+        )
+        old_single.generation = 9
+        old_single.created_at = datetime(2020, 1, 1, tzinfo=UTC)
+        session.add(
+            Summary(
+                content_fingerprint="latest-multi-post-unit",
+                model="fake-summary-v1",
+                prompt_version="single-content-v1",
+                generation=1,
+                summary="Latest complete thread summary",
+                key_points=["thread"],
+                topics=["ai"],
+                importance=4,
+                language="en",
+                source_ids=[ids["older"], ids["saved"]],
+                created_at=datetime(2030, 1, 1, tzinfo=UTC),
+            )
+        )
+
+    response = client.post(
+        f"/api/posts/{ids['saved']}/summaries/regenerate",
+        headers={**AUTH, "Idempotency-Key": "latest-unit-request"},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["source_ids"] == [ids["older"], ids["saved"]]
+    assert response.json()["generation"] == 2
+
+
+def test_summary_regeneration_recovers_same_request_commit_race(api, monkeypatch) -> None:
+    _client, factory, ids = api
+    session = factory()
+    service = JobService(
+        session=session,
+        pipeline=FakePipeline(),
+        summarizer=DeterministicSummarizer(),
+    )
+
+    def competing_commit() -> None:
+        pending = next(row for row in session.new if isinstance(row, Summary))
+        with factory.begin() as competing:
+            competing.add(
+                Summary(
+                    content_fingerprint=pending.content_fingerprint,
+                    model=pending.model,
+                    prompt_version=pending.prompt_version,
+                    generation=pending.generation,
+                    regeneration_request_id=pending.regeneration_request_id,
+                    summary=pending.summary,
+                    key_points=pending.key_points,
+                    topics=pending.topics,
+                    importance=pending.importance,
+                    language=pending.language,
+                    source_ids=pending.source_ids,
+                    token_usage=pending.token_usage,
+                    status=pending.status,
+                )
+            )
+        raise IntegrityError("insert summary", {}, RuntimeError("unique conflict"))
+
+    monkeypatch.setattr(session, "commit", competing_commit)
+    try:
+        recovered = asyncio.run(
+            service.regenerate_summary(ids["older"], "concurrent-summary-request")
+        )
+    finally:
+        session.close()
+
+    assert recovered.regeneration_request_id == "concurrent-summary-request"
+    with factory() as check:
+        rows = check.scalars(
+            select(Summary).where(
+                Summary.regeneration_request_id == "concurrent-summary-request"
+            )
+        ).all()
+        assert len(rows) == 1
+        assert recovered.id == rows[0].id
 
 
 def test_sync_job_returns_pipeline_result_and_status_is_safe(api) -> None:
@@ -369,6 +569,33 @@ def test_unexpected_api_errors_never_expose_exception_text(api) -> None:
     assert "provider secret" not in str(response.json())
 
 
+def test_unexpected_api_errors_are_logged_with_request_id(api, caplog) -> None:
+    client, _factory, ids = api
+    client.app.state.pipeline_service = FailingPipeline()
+    safe_client = TestClient(client.app, raise_server_exceptions=False)
+
+    with caplog.at_level(logging.ERROR, logger="x_digest.api.errors"):
+        response = safe_client.post(f"/api/jobs/sync/{ids['list']}", headers=AUTH)
+
+    record = next(record for record in caplog.records if record.message == "Unexpected API error")
+    assert record.request_id == response.json()["request_id"]
+
+
+def test_sync_job_omits_unknown_pipeline_error_text(api) -> None:
+    client, _factory, ids = api
+    client.app.state.pipeline_service = LeakyPipeline()
+
+    response = client.post(f"/api/jobs/sync/{ids['list']}", headers=AUTH)
+
+    assert response.status_code == 200
+    assert response.json()["stages"]["links"]["last_error"] is None
+    assert (
+        response.json()["stages"]["summary"]["last_error"]
+        == "summary_processing_failed"
+    )
+    assert "super-secret" not in str(response.json())
+
+
 def test_openapi_exposes_all_protected_api_paths(api) -> None:
     client, _factory, _ids = api
 
@@ -386,3 +613,9 @@ def test_openapi_exposes_all_protected_api_paths(api) -> None:
         "/api/jobs/sync/{list_id}",
         "/api/status",
     } <= set(paths)
+    assert all(
+        operation.get("security")
+        for path, operations in paths.items()
+        if path.startswith("/api/")
+        for operation in operations.values()
+    )

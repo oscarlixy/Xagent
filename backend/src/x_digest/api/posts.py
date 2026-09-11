@@ -45,6 +45,21 @@ class PostService:
         cursor: str | None,
         limit: int,
     ) -> PostPageResponse:
+        if from_at is not None and to_at is not None:
+            try:
+                reversed_window = from_at > to_at
+            except TypeError as error:
+                raise APIError(
+                    422,
+                    "invalid_time_window",
+                    "Start time must not be after end time",
+                ) from error
+            if reversed_window:
+                raise APIError(
+                    422,
+                    "invalid_time_window",
+                    "Start time must not be after end time",
+                )
         statement = select(Post).join(Author)
         if list_id is not None:
             statement = statement.join(PostListMembership).where(

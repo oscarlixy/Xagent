@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Awaitable, Callable
 from secrets import token_hex
 
@@ -5,6 +6,8 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
+
+logger = logging.getLogger(__name__)
 
 
 class DatabaseUnavailableError(RuntimeError):
@@ -86,6 +89,11 @@ def install_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(Exception)
     async def unexpected_error_handler(request: Request, _error: Exception) -> JSONResponse:
+        logger.error(
+            "Unexpected API error",
+            exc_info=_error,
+            extra={"request_id": _request_id(request)},
+        )
         return _error_response(
             request,
             status_code=500,

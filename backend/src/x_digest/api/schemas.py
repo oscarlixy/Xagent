@@ -3,11 +3,17 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+_SAFE_PIPELINE_ERROR_CODES = {
+    "link_failed",
+    "link_processing_failed",
+    "summary_processing_failed",
+}
 
 
 class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", from_attributes=True)
+    model_config = ConfigDict(extra="forbid", from_attributes=True, strict=True)
 
 
 class ErrorResponse(StrictModel):
@@ -129,6 +135,11 @@ class StageResultResponse(StrictModel):
     counts: dict[str, int]
     duration_ms: int
     last_error: str | None = None
+
+    @field_validator("last_error", mode="before")
+    @classmethod
+    def omit_unknown_error(cls, value: object) -> str | None:
+        return value if isinstance(value, str) and value in _SAFE_PIPELINE_ERROR_CODES else None
 
 
 class PipelineResultResponse(StrictModel):
