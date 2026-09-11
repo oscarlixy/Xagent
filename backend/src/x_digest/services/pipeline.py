@@ -5,15 +5,21 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Literal
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from x_digest.models import Link, Post, PostListMembership, Summary, SyncRun
+from x_digest.models import Link, Post, PostListMembership, Summary, SyncRun, Thread, ThreadPost
 from x_digest.services.ingestion import IngestionService
 from x_digest.services.link_extraction import extract_links
-from x_digest.services.summarization import NormalizedContent, SummarizationService, Summarizer
+from x_digest.services.summarization import (
+    NormalizedContent,
+    SummarizationService,
+    Summarizer,
+)
+from x_digest.services.threading import ThreadPostView, assemble_threads
 
 logger = logging.getLogger(__name__)
 
@@ -122,51 +128,109 @@ class PipelineService:
                         link.error_code = "link_processing_failed"
                         counts["failed"] += 1
                         last_error = "link_processing_failed"
-                        logger.warning(
-                            json.dumps(
-                                {
-                                    "event": "pipeline.link_failed",
-                                    "list_id": list_id,
-                                    "error_code": "link_processing_failed",
-                                }
-                            )
-                        )
         return StageResult(counts=counts, duration_ms=_elapsed_ms(started), last_error=last_error)
 
     def _record_processing(self, list_id: str) -> StageResult:
         """Record deterministic local preparation before optional link work."""
 
         started = time.monotonic()
-        with self._session_factory() as session:
-            count = session.scalar(
-                select(func.count())
-                .select_from(Post)
+        counts = {"processed": 0, "threads_created": 0, "thread_posts_created": 0}
+        with self._session_factory.begin() as session:
+            posts = session.scalars(
+                select(Post)
                 .join(PostListMembership, PostListMembership.post_id == Post.id)
                 .where(PostListMembership.list_id == list_id)
+                .order_by(Post.created_at, Post.id)
+            ).all()
+            counts["processed"] = len(posts)
+            by_id = {post.id: post for post in posts}
+            groups = assemble_threads(
+                [
+                    ThreadPostView(
+                        id=post.id,
+                        author_id=post.author_id,
+                        created_at=post.created_at,
+                        conversation_id=post.conversation_id,
+                        in_reply_to_post_id=post.in_reply_to_post_id,
+                    )
+                    for post in posts
+                ]
             )
-        return StageResult(
-            counts={"processed": int(count or 0)}, duration_ms=_elapsed_ms(started)
-        )
+            for group in groups:
+                first = group.posts[0]
+                conversation_id = first.conversation_id or first.id
+                thread = session.scalar(
+                    select(Thread).where(
+                        Thread.conversation_id == conversation_id,
+                        Thread.author_id == first.author_id,
+                    )
+                )
+                if thread is None:
+                    thread = Thread(
+                        conversation_id=conversation_id,
+                        author_id=first.author_id,
+                        created_at=first.created_at,
+                    )
+                    session.add(thread)
+                    session.flush()
+                    counts["threads_created"] += 1
+                existing = {
+                    row.post_id: row
+                    for row in session.scalars(
+                        select(ThreadPost).where(ThreadPost.thread_id == thread.id)
+                    )
+                }
+                for position, view in enumerate(group.posts):
+                    thread_post = existing.get(view.id)
+                    if thread_post is None:
+                        session.add(
+                            ThreadPost(
+                                thread_id=thread.id,
+                                post_id=by_id[view.id].id,
+                                position=position,
+                            )
+                        )
+                        counts["thread_posts_created"] += 1
+                    else:
+                        thread_post.position = position
+        return StageResult(counts=counts, duration_ms=_elapsed_ms(started))
 
     async def _summarize_pending_posts(self, list_id: str) -> StageResult:
         started = time.monotonic()
         with self._session_factory() as session:
-            summarized_post_ids = {
-                source_id
-                for summary in session.scalars(select(Summary)).all()
-                for source_id in summary.source_ids
-            }
-            posts = [
-                post
-                for post in session.scalars(
+            threads = session.scalars(
+                select(Thread)
+                .join(ThreadPost, ThreadPost.thread_id == Thread.id)
+                .join(Post, Post.id == ThreadPost.post_id)
+                .join(PostListMembership, PostListMembership.post_id == Post.id)
+                .where(PostListMembership.list_id == list_id)
+                .order_by(Thread.created_at, Thread.id)
+            ).unique().all()
+            pending = []
+            for thread in threads:
+                posts = session.scalars(
                     select(Post)
-                    .join(PostListMembership, PostListMembership.post_id == Post.id)
-                    .where(PostListMembership.list_id == list_id)
-                    .order_by(Post.created_at, Post.id)
+                    .join(ThreadPost, ThreadPost.post_id == Post.id)
+                    .where(ThreadPost.thread_id == thread.id)
+                    .order_by(ThreadPost.position, Post.id)
                 ).all()
-                if post.id not in summarized_post_ids
-            ][: self._llm_max_items_per_run]
-            pending = [NormalizedContent(source_ids=(post.id,), text=post.text) for post in posts]
+                content = NormalizedContent(
+                    source_ids=tuple(post.id for post in posts),
+                    text="\n\n".join(post.text for post in posts),
+                )
+                fingerprint = SummarizationService.fingerprint_for(content)
+                current = session.scalar(
+                    select(Summary).where(
+                        Summary.content_fingerprint == fingerprint,
+                        Summary.model == self._summarizer.model_name,
+                        Summary.prompt_version == "single-content-v1",
+                        Summary.generation == 1,
+                        Summary.status == "succeeded",
+                    )
+                )
+                if current is None:
+                    pending.append(content)
+            pending = pending[: self._llm_max_items_per_run]
 
         counts = {"selected": len(pending), "created": 0, "failed": 0}
         last_error: str | None = None
@@ -182,15 +246,6 @@ class PipelineService:
             except Exception:
                 counts["failed"] += 1
                 last_error = "summary_processing_failed"
-                logger.warning(
-                    json.dumps(
-                        {
-                            "event": "pipeline.summary_failed",
-                            "list_id": list_id,
-                            "error_code": last_error,
-                        }
-                    )
-                )
         return StageResult(counts=counts, duration_ms=_elapsed_ms(started), last_error=last_error)
 
     def _finish_run(
@@ -201,6 +256,7 @@ class PipelineService:
             if sync_run is None:  # pragma: no cover - ingestion creates the run
                 return
             sync_run.status = status
+            sync_run.finished_at = datetime.now().astimezone()
             sync_run.error_code = next(
                 (stage.last_error for stage in stages.values() if stage.last_error), None
             )

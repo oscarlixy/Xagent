@@ -56,25 +56,28 @@ class SummarizationService:
                 Summary.generation == 1,
             )
         )
-        if existing is not None:
+        if existing is not None and existing.status == "succeeded":
             return existing, False
 
         output = await self._summarizer.summarize(content)
         if set(output.source_ids) != set(content.source_ids):
             raise ValueError("Summary output source IDs do not match the input")
-        summary = Summary(
+        summary = existing or Summary(
             content_fingerprint=fingerprint,
             model=self._summarizer.model_name,
             prompt_version=PROMPT_VERSION,
             generation=1,
-            summary=output.summary,
-            key_points=output.key_points,
-            topics=output.topics,
-            importance=output.importance,
-            language=output.language,
-            source_ids=output.source_ids,
         )
-        self._session.add(summary)
+        summary.summary = output.summary
+        summary.key_points = output.key_points
+        summary.topics = output.topics
+        summary.importance = output.importance
+        summary.language = output.language
+        summary.source_ids = output.source_ids
+        summary.status = "succeeded"
+        summary.failure_code = None
+        if existing is None:
+            self._session.add(summary)
         self._session.flush()
         return summary, True
 
@@ -82,3 +85,5 @@ class SummarizationService:
     def _fingerprint(content: NormalizedContent) -> str:
         payload = "\n".join((*content.source_ids, content.text, content.link_text, PROMPT_VERSION))
         return hashlib.sha256(payload.encode()).hexdigest()
+
+    fingerprint_for = _fingerprint

@@ -27,7 +27,10 @@ def test_status_snapshot_exposes_stage_metrics_without_provider_payloads_or_secr
                         },
                         "summary": {"counts": {"created": 1}, "duration_ms": 8, "error_code": None},
                         "links": {
-                            "counts": {"failed": 1},
+                            "counts": {
+                                "failed": 1,
+                                "provider_payload": {"api_key": "nested-secret"},
+                            },
                             "duration_ms": 1,
                             "error_code": "link_failed",
                         },
@@ -48,3 +51,4 @@ def test_status_snapshot_exposes_stage_metrics_without_provider_payloads_or_secr
     }
     assert "provider_payload" not in str(snapshot)
     assert "super-secret" not in str(snapshot)
+    assert "nested-secret" not in str(snapshot)
