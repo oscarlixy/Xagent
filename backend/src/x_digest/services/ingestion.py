@@ -1,0 +1,138 @@
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Literal
+
+from sqlalchemy.orm import Session, sessionmaker
+
+from x_digest.models import XList
+from x_digest.repositories.jobs import advance_list_watermark, begin_sync_run, finish_sync_run
+from x_digest.repositories.posts import AuthorInput, PostInput, attach_to_list, upsert_post
+from x_digest.sources.base import XSource
+from x_digest.sources.types import RawPost
+
+
+@dataclass(frozen=True)
+class SyncResult:
+    run_id: str
+    status: Literal["succeeded", "partial", "failed"]
+    pages_fetched: int
+    posts_seen: int
+    posts_created: int
+    duplicates: int
+    rejected: int
+
+
+class IngestionService:
+    def __init__(
+        self,
+        *,
+        session_factory: sessionmaker[Session],
+        source: XSource,
+        max_pages: int = 5,
+        max_posts: int = 500,
+    ) -> None:
+        self._session_factory = session_factory
+        self._source = source
+        self._max_pages = max_pages
+        self._max_posts = max_posts
+
+    async def sync_list(self, list_id: str) -> SyncResult:
+        with self._session_factory.begin() as session:
+            x_list = session.get(XList, list_id)
+            if x_list is None:
+                raise ValueError(f"Unknown List: {list_id}")
+            sync_run = begin_sync_run(session, list_id=list_id)
+            result = await self._ingest_pages(session, x_list, sync_run.id)
+            finish_sync_run(session, sync_run=sync_run, status=result.status)
+            if result.status == "succeeded" and result.latest_seen_at is not None:
+                advance_list_watermark(
+                    session,
+                    x_list=x_list,
+                    sync_run=sync_run,
+                    latest_seen_at=result.latest_seen_at,
+                    latest_seen_post_id=result.latest_seen_post_id or "",
+                )
+            sync_run.pages_fetched = result.pages_fetched
+            sync_run.posts_seen = result.posts_seen
+            sync_run.posts_created = result.posts_created
+            sync_run.duplicates = result.duplicates
+            sync_run.rejected = result.rejected
+            return SyncResult(
+                run_id=sync_run.id,
+                status=result.status,
+                pages_fetched=result.pages_fetched,
+                posts_seen=result.posts_seen,
+                posts_created=result.posts_created,
+                duplicates=result.duplicates,
+                rejected=result.rejected,
+            )
+
+    async def _ingest_pages(
+        self, session: Session, x_list: XList, run_id: str
+    ) -> "_MutableSyncResult":
+        result = _MutableSyncResult(run_id=run_id)
+        pagination_token: str | None = None
+        while result.pages_fetched < self._max_pages and result.posts_seen < self._max_posts:
+            page = await self._source.fetch_page(
+                list_id=x_list.platform_list_id,
+                pagination_token=pagination_token,
+                max_results=min(100, self._max_posts - result.posts_seen),
+            )
+            result.pages_fetched += 1
+            result.rejected += len(page.rejected_items)
+            for raw_post in page.posts:
+                if result.posts_seen >= self._max_posts:
+                    break
+                self._store_post(session, x_list, raw_post, result)
+            if page.next_token is None:
+                break
+            pagination_token = page.next_token
+        return result
+
+    @staticmethod
+    def _store_post(
+        session: Session, x_list: XList, raw_post: RawPost, result: "_MutableSyncResult") -> None:
+        post, created = upsert_post(
+            session,
+            PostInput(
+                platform_post_id=raw_post.id,
+                author=AuthorInput(
+                    platform_author_id=raw_post.author.id,
+                    username=raw_post.author.username,
+                    display_name=raw_post.author.display_name,
+                ),
+                text=raw_post.text,
+                created_at=raw_post.created_at,
+                source_url=raw_post.source_url,
+                conversation_id=raw_post.conversation_id,
+                in_reply_to_post_id=raw_post.in_reply_to_post_id,
+                references_json=raw_post.references,
+                entities_json=raw_post.entities,
+                media_json=raw_post.media,
+            ),
+        )
+        attach_to_list(session, post.id, x_list.id)
+        result.posts_seen += 1
+        if created:
+            result.posts_created += 1
+        else:
+            result.duplicates += 1
+        if result.latest_seen_at is None or (raw_post.created_at, raw_post.id) > (
+            result.latest_seen_at,
+            result.latest_seen_post_id or "",
+        ):
+            result.latest_seen_at = raw_post.created_at
+            result.latest_seen_post_id = raw_post.id
+
+
+@dataclass
+class _MutableSyncResult:
+    run_id: str
+    status: Literal["succeeded", "partial", "failed"] = "succeeded"
+    pages_fetched: int = 0
+    posts_seen: int = 0
+    posts_created: int = 0
+    duplicates: int = 0
+    rejected: int = 0
+    latest_seen_at: datetime | None = None
+    latest_seen_post_id: str | None = None
