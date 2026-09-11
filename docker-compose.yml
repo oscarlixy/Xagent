@@ -1,4 +1,18 @@
 services:
+  frontend:
+    image: x-digest-frontend
+    build:
+      context: ./frontend
+    depends_on:
+      - backend
+    environment:
+      BACKEND_INTERNAL_URL: http://backend:8000
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+      OPERATOR_USERNAME: ${OPERATOR_USERNAME}
+      OPERATOR_PASSWORD: ${OPERATOR_PASSWORD}
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-3000}:3000"
+
   backend:
     image: x-digest
     build:
@@ -9,6 +23,7 @@ services:
         required: false
     environment:
       DATABASE_URL: sqlite+pysqlite:////data/x_digest.db
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
     expose:
       - "8000"
     volumes:
