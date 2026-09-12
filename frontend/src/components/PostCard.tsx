@@ -9,6 +9,7 @@ import {
   updatePostState,
 } from "../lib/api";
 import { SummaryPanel } from "./SummaryPanel";
+import { trustedSourceUrl } from "../lib/source-url";
 
 const actions: Array<{ key: keyof PostState; label: string }> = [
   { key: "read", label: "Mark as read" },
@@ -21,6 +22,7 @@ export function PostCard({ post }: { post: Post }) {
   const [summary, setSummary] = useState<Summary | null>(null);
   const [pending, setPending] = useState<keyof PostState | "summary" | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const sourceUrl = trustedSourceUrl(post.source_url);
 
   async function toggle(key: keyof PostState) {
     const previous = state;
@@ -61,9 +63,13 @@ export function PostCard({ post }: { post: Post }) {
         <div className="topic-row">
           {post.topics.map((topic) => <span key={topic}>{topic}</span>)}
         </div>
-        <a className="source-link" href={post.source_url} target="_blank" rel="noopener noreferrer">
-          View original on X <span aria-hidden="true">↗</span>
-        </a>
+        {sourceUrl ? (
+          <a className="source-link" href={sourceUrl} target="_blank" rel="noopener noreferrer">
+            View original on X <span aria-hidden="true">↗</span>
+          </a>
+        ) : (
+          <span className="source-unavailable">Original source link unavailable</span>
+        )}
         <div className="action-row" aria-label="Post actions">
           {actions.map(({ key, label }) => (
             <button

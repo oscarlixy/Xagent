@@ -18,6 +18,17 @@ test("requires operator Basic Auth for the reading interface", async ({ request 
   expect(response.headers()["www-authenticate"]).toBe('Basic realm="X Digest"');
 });
 
+test("rejects incorrect operator Basic Auth credentials", async ({ browser }) => {
+  const context = await browser.newContext({
+    httpCredentials: { username: "reader", password: "incorrect-password" },
+  });
+  const response = await context.request.get("/");
+
+  expect(response.status()).toBe(401);
+  expect(response.headers()["www-authenticate"]).toBe('Basic realm="X Digest"');
+  await context.close();
+});
+
 test("proxies API requests with server credentials and preserves the backend request ID", async ({
   request,
 }) => {
@@ -26,6 +37,40 @@ test("proxies API requests with server credentials and preserves the backend req
   expect(response.status()).toBe(200);
   expect((await response.json())[0].id).toBe("digest-1");
   expect(response.headers()["x-request-id"]).toBe("mock-request-id");
+});
+
+test("forwards only allowlisted BFF request and response headers", async ({ request }) => {
+  const response = await request.post("/api/inspect?topic=ai", {
+    headers: {
+      ...operatorHeaders,
+      Accept: "application/vnd.x-digest+json",
+      Cookie: "operator_session=must-not-pass",
+      "Idempotency-Key": "summary-request-1",
+      "X-Untrusted": "must-not-pass",
+    },
+    data: { visible: true },
+  });
+
+  expect(response.status()).toBe(200);
+  expect(await response.json()).toMatchObject({
+    method: "POST",
+    query: "topic=ai",
+    headers: {
+      authorization: "Bearer test-internal-token-that-must-stay-server-side",
+      accept: "application/vnd.x-digest+json",
+      "content-type": "application/json",
+      "idempotency-key": "summary-request-1",
+      cookie: null,
+      "x-untrusted": null,
+    },
+  });
+  expect(response.headers()["x-request-id"]).toBe("inspect-request-id");
+  expect(response.headers()["x-upstream-secret"]).toBeUndefined();
+});
+
+test("rejects methods outside the BFF allowlist", async ({ request }) => {
+  const response = await request.put("/api/inspect", { headers: operatorHeaders });
+  expect(response.status()).toBe(405);
 });
 
 test("leaves the health endpoint public", async ({ request }) => {
@@ -37,6 +82,13 @@ test("leaves the health endpoint public", async ({ request }) => {
 test("does not exempt paths below the health endpoint from authentication", async ({ request }) => {
   const response = await request.get("/health/private");
   expect(response.status()).toBe(401);
+});
+
+test("does not treat static and image lookalike prefixes as public assets", async ({ request }) => {
+  for (const path of ["/_next/static-evil/file.js", "/_next/image-proxy/file.png"]) {
+    const response = await request.get(path);
+    expect(response.status(), path).toBe(401);
+  }
 });
 
 test("shows digest list and a safe detail view with original source links", async ({ browser }) => {
@@ -52,6 +104,24 @@ test("shows digest list and a safe detail view with original source links", asyn
     "href",
     "https://x.com/alice/status/19001",
   );
+  await context.close();
+});
+
+test("does not make an untrusted post source URL clickable", async ({ browser }) => {
+  const { context, page } = await authenticatedPage(browser);
+  await page.goto("/posts?author=unsafe-link");
+
+  await expect(page.getByText("Original launch notes with practical deployment details.")).toBeVisible();
+  await expect(page.getByRole("link", { name: "View original on X" })).toHaveCount(0);
+  await context.close();
+});
+
+test("does not make an untrusted digest snapshot URL clickable", async ({ browser }) => {
+  const { context, page } = await authenticatedPage(browser);
+  await page.goto("/digests/digest-unsafe");
+
+  await expect(page.getByRole("heading", { name: "Unsafe Digest" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "View original on X" })).toHaveCount(0);
   await context.close();
 });
 
@@ -75,6 +145,27 @@ test("keeps every post filter in the URL and shows the matching stream", async (
   await expect(page).toHaveURL(/state=saved/);
   await expect(page.getByText("Original launch notes with practical deployment details.")).toBeVisible();
   await expect(page.getByRole("link", { name: "View original on X" })).toBeVisible();
+  await context.close();
+});
+
+test("includes the whole selected end date in the backend filter", async ({ browser }) => {
+  const { context, page } = await authenticatedPage(browser);
+  await page.goto("/posts?author=date-boundary&to=2026-09-11");
+
+  await expect(page).toHaveURL(/to=2026-09-11/);
+  await expect(page.getByText("A post from the final minute of the selected day.")).toBeVisible();
+  await context.close();
+});
+
+test("loads and appends the next post cursor page", async ({ browser }) => {
+  const { context, page } = await authenticatedPage(browser);
+  await page.goto("/posts?author=pagination");
+
+  await expect(page.getByText("First page post")).toBeVisible();
+  await page.getByRole("button", { name: "Load more posts" }).click();
+  await expect(page.getByText("First page post")).toBeVisible();
+  await expect(page.getByText("Second page post")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Load more posts" })).toHaveCount(0);
   await context.close();
 });
 
@@ -112,7 +203,13 @@ test("regenerates a digest and shows the new immutable version", async ({ browse
   await page.goto("/digests/digest-1");
 
   await page.getByRole("button", { name: "Regenerate digest" }).click();
+  await expect(page).toHaveURL(/\/digests\/digest-2$/);
   await expect(page.getByText("Version 2")).toBeVisible();
+  await expect(page.getByText("A newly sourced post for digest version two.")).toBeVisible();
+  await expect(page.getByRole("link", { name: "View original on X" })).toHaveAttribute(
+    "href",
+    "https://twitter.com/bob/status/19002",
+  );
   await context.close();
 });
 

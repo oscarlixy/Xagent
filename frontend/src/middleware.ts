@@ -12,7 +12,15 @@ function safeEqual(actual: string, expected: string): boolean {
 }
 
 export function middleware(request: NextRequest) {
-  if (request.nextUrl.pathname === "/health") return NextResponse.next();
+  const { pathname } = request.nextUrl;
+  const publicPath =
+    pathname === "/health" ||
+    pathname === "/favicon.ico" ||
+    pathname === "/_next/static" ||
+    pathname.startsWith("/_next/static/") ||
+    pathname === "/_next/image" ||
+    pathname.startsWith("/_next/image/");
+  if (publicPath) return NextResponse.next();
 
   const username = process.env.OPERATOR_USERNAME;
   const password = process.env.OPERATOR_PASSWORD;
@@ -46,5 +54,5 @@ export function middleware(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/((?!_next/static|_next/image|favicon.ico$).*)"],
+  matcher: ["/:path*"],
 };

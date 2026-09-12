@@ -1,16 +1,18 @@
 "use client";
 
 import Link from "next/link";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { SummaryPanel } from "../../../components/SummaryPanel";
 import { type Digest, type Post, getDigest, getPostsByIds, regenerateDigest } from "../../../lib/api";
+import { trustedSourceUrl } from "../../../lib/source-url";
 
 const stringValue = (value: unknown, fallback = "") => typeof value === "string" ? value : fallback;
 const stringList = (value: unknown) => Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 
 export default function DigestPage() {
   const { id } = useParams<{ id: string }>();
+  const router = useRouter();
   const [digest, setDigest] = useState<Digest | null>(null);
   const [sourcePosts, setSourcePosts] = useState<Record<string, Post>>({});
   const [error, setError] = useState<string | null>(null);
@@ -30,7 +32,10 @@ export default function DigestPage() {
     setRegenerating(true);
     setError(null);
     try {
-      setDigest(await regenerateDigest(id));
+      const regenerated = await regenerateDigest(id);
+      setSourcePosts({});
+      setDigest(regenerated);
+      router.push(`/digests/${encodeURIComponent(regenerated.id)}`);
     } catch {
       setError("Could not regenerate this digest. The existing version is unchanged.");
     } finally {
@@ -69,7 +74,7 @@ export default function DigestPage() {
           const sources = stringList(snapshot.source_ids)
             .map((sourceId) => sourcePosts[sourceId])
             .filter((post): post is Post => post !== undefined);
-          const snapshotSourceUrl = stringValue(snapshot.source_url);
+          const snapshotSourceUrl = trustedSourceUrl(snapshot.source_url);
           const originalText = sources[0]?.text || stringValue(snapshot.text, "Original text unavailable in this snapshot.");
           return (
             <article className="digest-item" key={item.id}>
@@ -77,11 +82,14 @@ export default function DigestPage() {
               <p className="post-text">{originalText}</p>
               <SummaryPanel summary={stringValue(snapshot.summary)} keyPoints={stringList(snapshot.key_points)} />
               <div className="source-list">
-                {sources.map((source) => (
-                  <a className="source-link" href={source.source_url} key={source.id} target="_blank" rel="noopener noreferrer">
-                    View original on X (@{source.author.username}) <span aria-hidden="true">↗</span>
-                  </a>
-                ))}
+                {sources.map((source) => {
+                  const sourceUrl = trustedSourceUrl(source.source_url);
+                  return sourceUrl ? (
+                    <a className="source-link" href={sourceUrl} key={source.id} target="_blank" rel="noopener noreferrer">
+                      View original on X (@{source.author.username}) <span aria-hidden="true">↗</span>
+                    </a>
+                  ) : null;
+                })}
                 {sources.length === 0 && snapshotSourceUrl ? (
                   <a className="source-link" href={snapshotSourceUrl} target="_blank" rel="noopener noreferrer">View original on X <span aria-hidden="true">↗</span></a>
                 ) : null}
