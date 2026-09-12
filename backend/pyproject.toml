@@ -10,6 +10,7 @@ requires-python = ">=3.12,<3.15"
 dependencies = [
   "APScheduler>=3.11,<4",
   "alembic>=1.14,<2",
+  "cryptography>=43,<47",
   "fastapi>=0.115,<1",
   "pydantic-settings>=2.6,<3",
   "sqlalchemy>=2.0,<3",

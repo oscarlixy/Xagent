@@ -13,6 +13,9 @@ class Settings(BaseSettings):
     app_timezone: str = "UTC"
     internal_api_token: SecretStr | None = None
     x_bearer_token: SecretStr | None = None
+    x_client_id: str | None = None
+    x_oauth_redirect_uri: AnyHttpUrl | None = None
+    x_token_encryption_key: SecretStr | None = None
     x_max_pages_per_sync: int = Field(default=5, ge=1, le=100)
     x_max_posts_per_sync: int = Field(default=500, ge=1, le=10_000)
     digest_cadence: Literal["6h", "daily", "both"] = "daily"
