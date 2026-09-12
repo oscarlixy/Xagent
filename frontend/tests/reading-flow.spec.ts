@@ -1,5 +1,9 @@
 import { expect, test, type Browser } from "@playwright/test";
 
+const oauthStateSecret = "test-x-oauth-state-secret-32-bytes-minimum";
+const oauthClientId = "test-x-client-id-must-stay-server-side";
+const oauthRedirectUri = "http://127.0.0.1:3100/api/x/callback";
+
 const operatorHeaders = {
   Authorization: `Basic ${Buffer.from("reader:correct-horse-battery-staple").toString("base64")}`,
 };
@@ -9,6 +13,63 @@ async function authenticatedPage(browser: Browser) {
     httpCredentials: { username: "reader", password: "correct-horse-battery-staple" },
   });
   return { context, page: await context.newPage() };
+}
+
+function base64url(value: Uint8Array | string): string {
+  const bytes = typeof value === "string" ? Buffer.from(value) : Buffer.from(value);
+  return bytes.toString("base64url");
+}
+
+async function signedStateCookie(payload: {
+  state: string;
+  verifier: string;
+  expiry: number;
+}): Promise<string> {
+  const encodedPayload = base64url(JSON.stringify(payload));
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(oauthStateSecret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(encodedPayload),
+  );
+  return `${encodedPayload}.${base64url(new Uint8Array(signature))}`;
+}
+
+function oauthCookie(response: { headersArray(): { name: string; value: string }[] }): string {
+  const header = response
+    .headersArray()
+    .find(({ name }) => name.toLowerCase() === "set-cookie")?.value;
+  expect(header).toBeDefined();
+  return header!.split(";", 1)[0];
+}
+
+function decodedCookiePayload(cookie: string): {
+  state: string;
+  verifier: string;
+  expiry: number;
+} {
+  const value = cookie.slice(cookie.indexOf("=") + 1);
+  const [payload] = value.split(".");
+  return JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+}
+
+function expectClearedOAuthCookie(response: {
+  headersArray(): { name: string; value: string }[];
+}) {
+  const header = response
+    .headersArray()
+    .find(({ name }) => name.toLowerCase() === "set-cookie")?.value;
+  expect(header).toContain("x_oauth_state=");
+  expect(header?.toLowerCase()).toContain("max-age=0");
+  expect(header?.toLowerCase()).toContain("httponly");
+  expect(header?.toLowerCase()).toContain("samesite=lax");
+  expect(header?.toLowerCase()).toContain("path=/api/x");
 }
 
 test("requires operator Basic Auth for the reading interface", async ({ request }) => {
@@ -88,6 +149,195 @@ test("does not treat static and image lookalike prefixes as public assets", asyn
   for (const path of ["/_next/static-evil/file.js", "/_next/image-proxy/file.png"]) {
     const response = await request.get(path);
     expect(response.status(), path).toBe(401);
+  }
+});
+
+test("starts X authorization with S256 PKCE and a protected state cookie", async ({ request }) => {
+  const response = await request.get("/api/x/authorize", {
+    headers: operatorHeaders,
+    maxRedirects: 0,
+  });
+
+  expect(response.status()).toBe(307);
+  const location = new URL(response.headers().location);
+  expect(location.origin + location.pathname).toBe("http://127.0.0.1:9100/mock-x/authorize");
+  expect(Object.fromEntries(location.searchParams)).toMatchObject({
+    client_id: oauthClientId,
+    redirect_uri: oauthRedirectUri,
+    response_type: "code",
+    code_challenge_method: "S256",
+    scope: "tweet.read users.read list.read offline.access",
+  });
+
+  const cookie = oauthCookie(response);
+  const setCookie = response.headersArray().find(({ name }) => name.toLowerCase() === "set-cookie")!
+    .value;
+  expect(setCookie.toLowerCase()).toContain("httponly");
+  expect(setCookie.toLowerCase()).toContain("samesite=lax");
+  expect(setCookie.toLowerCase()).toContain("path=/api/x");
+  expect(setCookie.toLowerCase()).toContain("max-age=600");
+  expect(setCookie.toLowerCase()).toContain("secure");
+
+  const payload = decodedCookiePayload(cookie);
+  expect(Number.isInteger(payload.expiry)).toBe(true);
+  expect(payload.expiry).toBeGreaterThan(Math.floor(Date.now() / 1000));
+  expect(location.searchParams.get("state")).toBe(payload.state);
+  expect(location.searchParams.toString()).not.toContain(payload.verifier);
+  const verifierDigest = await crypto.subtle.digest("SHA-256", Buffer.from(payload.verifier));
+  expect(location.searchParams.get("code_challenge")).toBe(
+    base64url(new Uint8Array(verifierDigest)),
+  );
+});
+
+test("only the exact OAuth callback path bypasses operator Basic Auth", async ({ request }) => {
+  const callback = await request.get("/api/x/callback", { maxRedirects: 0 });
+  expect(callback.status()).not.toBe(401);
+
+  for (const path of ["/api/x/authorize", "/api/x/callback/", "/api/x/callback/child"]) {
+    const response = await request.get(path, { maxRedirects: 0 });
+    expect(response.status(), path).toBe(401);
+  }
+});
+
+test("rejects missing, tampered, and expired OAuth state without leaking inputs", async ({
+  request,
+}) => {
+  const authorization = await request.get("/api/x/authorize", {
+    headers: operatorHeaders,
+    maxRedirects: 0,
+  });
+  const validCookie = oauthCookie(authorization);
+  const validPayload = decodedCookiePayload(validCookie);
+  const cookieValue = validCookie.slice(validCookie.indexOf("=") + 1);
+  const tamperedCookie = `x_oauth_state=${cookieValue.slice(0, -1)}${cookieValue.endsWith("a") ? "b" : "a"}`;
+  const expiredState = "expired-state-must-not-leak";
+  const expiredVerifier = "expired-verifier-must-not-leak";
+  const expiredCookie = `x_oauth_state=${await signedStateCookie({
+    state: expiredState,
+    verifier: expiredVerifier,
+    expiry: Math.floor(Date.now() / 1000) - 1,
+  })}`;
+
+  for (const scenario of [
+    { cookie: undefined, state: validPayload.state, code: "missing-cookie-code-must-not-leak" },
+    { cookie: tamperedCookie, state: validPayload.state, code: "tampered-code-must-not-leak" },
+    { cookie: expiredCookie, state: expiredState, code: "expired-code-must-not-leak" },
+  ]) {
+    const response = await request.get(
+      `/api/x/callback?code=${encodeURIComponent(scenario.code)}&state=${encodeURIComponent(scenario.state)}`,
+      {
+        headers: scenario.cookie ? { Cookie: scenario.cookie } : undefined,
+        maxRedirects: 0,
+      },
+    );
+    expect(response.status()).toBe(307);
+    expect(response.headers().location).toBe("http://127.0.0.1:3100/?x_auth=failed");
+    expect(response.headers().location).not.toContain(scenario.code);
+    expect(response.headers().location).not.toContain(scenario.state);
+    expect(response.headers().location).not.toContain(expiredVerifier);
+    expectClearedOAuthCookie(response);
+  }
+});
+
+test("turns an X denial into the fixed denied redirect and clears state", async ({ request }) => {
+  const state = "denied-state-must-not-leak";
+  const verifier = "denied-verifier-must-not-leak";
+  const cookie = await signedStateCookie({
+    state,
+    verifier,
+    expiry: Math.floor(Date.now() / 1000) + 300,
+  });
+  const response = await request.get(
+    `/api/x/callback?error=access_denied&state=${encodeURIComponent(state)}`,
+    { headers: { Cookie: `x_oauth_state=${cookie}` }, maxRedirects: 0 },
+  );
+
+  expect(response.status()).toBe(307);
+  expect(response.headers().location).toBe("http://127.0.0.1:3100/?x_auth=denied");
+  expect(response.headers().location).not.toContain(state);
+  expect(response.headers().location).not.toContain(verifier);
+  expectClearedOAuthCookie(response);
+});
+
+test("forwards only the callback code and verifier with server credentials", async ({ request }) => {
+  const authorization = await request.get("/api/x/authorize", {
+    headers: operatorHeaders,
+    maxRedirects: 0,
+  });
+  const cookie = oauthCookie(authorization);
+  const payload = decodedCookiePayload(cookie);
+  const code = "successful-callback-code-must-not-leak";
+  const response = await request.get(
+    `/api/x/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(payload.state)}`,
+    {
+      headers: {
+        ...operatorHeaders,
+        Cookie: cookie,
+        "X-Untrusted": "callback-header-must-not-pass",
+      },
+      maxRedirects: 0,
+    },
+  );
+
+  expect(response.status()).toBe(307);
+  expect(response.headers().location).toBe("http://127.0.0.1:3100/");
+  expectClearedOAuthCookie(response);
+
+  const inspection = await request.get("http://127.0.0.1:9100/oauth-inspect");
+  expect(await inspection.json()).toEqual({
+    body: { code, verifier: payload.verifier },
+    headers: {
+      authorization: "Bearer test-internal-token-that-must-stay-server-side",
+      content_type: "application/json",
+      cookie: null,
+      x_untrusted: null,
+    },
+  });
+});
+
+test("redacts callback inputs when the backend exchange fails", async ({ request }) => {
+  const state = "failure-state-must-not-leak";
+  const verifier = "failure-verifier-must-not-leak";
+  const code = "upstream-failure-code-must-not-leak";
+  const cookie = await signedStateCookie({
+    state,
+    verifier,
+    expiry: Math.floor(Date.now() / 1000) + 300,
+  });
+  const response = await request.get(
+    `/api/x/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`,
+    { headers: { Cookie: `x_oauth_state=${cookie}` }, maxRedirects: 0 },
+  );
+
+  expect(response.status()).toBe(307);
+  expect(response.headers().location).toBe("http://127.0.0.1:3100/?x_auth=failed");
+  expect(response.headers().location).not.toContain(code);
+  expect(response.headers().location).not.toContain(state);
+  expect(response.headers().location).not.toContain(verifier);
+  expectClearedOAuthCookie(response);
+});
+
+test("returns safe 503 responses for missing or invalid OAuth configuration", async ({ request }) => {
+  for (const port of [3101, 3102]) {
+    const authorize = await request.get(`http://127.0.0.1:${port}/api/x/authorize`, {
+      headers: operatorHeaders,
+      maxRedirects: 0,
+    });
+    expect(authorize.status(), `authorize:${port}`).toBe(503);
+    expect(await authorize.json()).toEqual({
+      code: "oauth_not_configured",
+      message: "X OAuth is not configured",
+    });
+
+    const callback = await request.get(
+      `http://127.0.0.1:${port}/api/x/callback?code=config-code-must-not-leak&state=config-state-must-not-leak`,
+      { maxRedirects: 0 },
+    );
+    expect(callback.status(), `callback:${port}`).toBe(503);
+    const callbackBody = await callback.text();
+    expect(callbackBody).not.toContain("config-code-must-not-leak");
+    expect(callbackBody).not.toContain("config-state-must-not-leak");
+    expectClearedOAuthCookie(callback);
   }
 });
 

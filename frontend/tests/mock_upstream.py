@@ -6,6 +6,7 @@ from pydantic import BaseModel
 
 app = FastAPI()
 TOKEN = "Bearer test-internal-token-that-must-stay-server-side"
+last_oauth_request: dict[str, Any] = {}
 
 
 class StateUpdate(BaseModel):
@@ -111,6 +112,32 @@ UNSAFE_DIGEST = {
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/api/x/oauth/callback", status_code=204)
+async def oauth_callback(request: Request, authorization: str | None = Header(default=None)) -> Response:
+    require_token(authorization)
+    payload = await request.json()
+    last_oauth_request.clear()
+    last_oauth_request.update(
+        {
+            "body": payload,
+            "headers": {
+                "authorization": request.headers.get("authorization"),
+                "content_type": request.headers.get("content-type"),
+                "cookie": request.headers.get("cookie"),
+                "x_untrusted": request.headers.get("x-untrusted"),
+            },
+        }
+    )
+    if payload.get("code") == "upstream-failure-code-must-not-leak":
+        raise HTTPException(status_code=502, detail="upstream-failure-code-must-not-leak")
+    return Response(status_code=204)
+
+
+@app.get("/oauth-inspect")
+def oauth_inspect() -> dict[str, Any]:
+    return last_oauth_request
 
 
 @app.get("/api/digests")

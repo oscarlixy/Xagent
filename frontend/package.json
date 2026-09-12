@@ -6,7 +6,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "test": "INTERNAL_API_TOKEN=test-internal-token-that-must-stay-server-side npm run build && INTERNAL_API_TOKEN=test-internal-token-that-must-stay-server-side node --test tests/client-assets.test.mjs && playwright test",
+    "test": "INTERNAL_API_TOKEN=test-internal-token-that-must-stay-server-side X_CLIENT_ID=test-x-client-id-must-stay-server-side X_OAUTH_STATE_SECRET=test-x-oauth-state-secret-32-bytes-minimum npm run build && INTERNAL_API_TOKEN=test-internal-token-that-must-stay-server-side X_CLIENT_ID=test-x-client-id-must-stay-server-side X_OAUTH_STATE_SECRET=test-x-oauth-state-secret-32-bytes-minimum node --test tests/client-assets.test.mjs && playwright test",
     "test:e2e": "playwright test"
   },
   "dependencies": {

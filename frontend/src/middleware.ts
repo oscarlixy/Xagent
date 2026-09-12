@@ -15,6 +15,7 @@ export function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
   const publicPath =
     pathname === "/health" ||
+    pathname === "/api/x/callback" ||
     pathname === "/favicon.ico" ||
     pathname === "/_next/static" ||
     pathname.startsWith("/_next/static/") ||
