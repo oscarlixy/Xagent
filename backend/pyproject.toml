@@ -12,6 +12,7 @@ dependencies = [
   "alembic>=1.14,<2",
   "cryptography>=43,<47",
   "fastapi>=0.115,<1",
+  "httpx>=0.27,<1",
   "pydantic-settings>=2.6,<3",
   "sqlalchemy>=2.0,<3",
   "uvicorn[standard]>=0.30,<1",
@@ -19,7 +20,6 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-  "httpx>=0.27,<1",
   "mypy>=1.13,<2",
   "pytest>=8.3,<9",
   "ruff>=0.8,<1",
