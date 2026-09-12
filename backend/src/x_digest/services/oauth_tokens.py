@@ -39,7 +39,7 @@ class TokenVault:
         now: datetime,
     ) -> None:
         access_token, refresh_token, expires_in, scope = _validated_payload(token_payload)
-        now_utc = _aware_utc(now)
+        now_utc = _require_aware_utc(now)
         credential = self._session.get(OAuthCredential, provider)
         if credential is None:
             credential = OAuthCredential(
@@ -72,15 +72,16 @@ class TokenVault:
         return OAuthTokenSet(
             access_token=access_token,
             refresh_token=refresh_token,
-            access_expires_at=_aware_utc(credential.access_expires_at),
+            access_expires_at=_persisted_utc(credential.access_expires_at),
             scope=credential.scope,
         )
 
     def needs_refresh(self, *, provider: str, now: datetime) -> bool:
+        now_utc = _require_aware_utc(now)
         credential = self._session.get(OAuthCredential, provider)
         if credential is None:
             return True
-        return _aware_utc(credential.access_expires_at) <= _aware_utc(now) + REFRESH_MARGIN
+        return _persisted_utc(credential.access_expires_at) <= now_utc + REFRESH_MARGIN
 
 
 def _validated_payload(payload: Mapping[str, object]) -> tuple[str, str, int, str]:
@@ -102,7 +103,13 @@ def _validated_payload(payload: Mapping[str, object]) -> tuple[str, str, int, st
     return access_token, refresh_token, expires_in, scope
 
 
-def _aware_utc(value: datetime) -> datetime:
-    if value.tzinfo is None:
+def _require_aware_utc(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("OAuth token time must include a timezone")
+    return value.astimezone(UTC)
+
+
+def _persisted_utc(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)

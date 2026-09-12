@@ -97,6 +97,20 @@ def test_expiry_uses_utc_and_refreshes_at_the_sixty_second_margin(session: Sessi
     assert vault.needs_refresh(provider="x", now=NOW + timedelta(minutes=59))
 
 
+def test_store_rejects_a_naive_now_value(session: Session) -> None:
+    vault = TokenVault(session=session, encryption_key=FERNET_KEY)
+
+    with pytest.raises(ValueError):
+        vault.store(provider="x", token_payload=token_payload(), now=NOW.replace(tzinfo=None))
+
+
+def test_needs_refresh_rejects_a_naive_now_value(session: Session) -> None:
+    vault = TokenVault(session=session, encryption_key=FERNET_KEY)
+
+    with pytest.raises(ValueError):
+        vault.needs_refresh(provider="x", now=NOW.replace(tzinfo=None))
+
+
 @pytest.mark.parametrize(
     "payload",
     [
