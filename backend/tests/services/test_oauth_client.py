@@ -214,6 +214,22 @@ def test_concurrent_client_instances_share_one_process_refresh_lock(tmp_path) ->
     assert request_count == 1
 
 
+def test_exchange_during_refresh_preserves_the_new_authorization(
+    session_factory: sessionmaker[Session],
+) -> None:
+    _seed(session_factory)
+
+    refresh_result, authorized, stored = asyncio.run(
+        _exchange_while_refresh_is_in_flight(session_factory)
+    )
+
+    assert authorized.access_token == "authorized-access"
+    assert refresh_result == "authorized-access"
+    assert stored is not None
+    assert stored.access_token == "authorized-access"
+    assert stored.refresh_token == "authorized-refresh"
+
+
 async def _concurrent_tokens(service: XOAuthClient) -> tuple[str, str]:
     first, second = await asyncio.gather(service.access_token(), service.access_token())
     return first, second
@@ -222,6 +238,60 @@ async def _concurrent_tokens(service: XOAuthClient) -> tuple[str, str]:
 async def _tokens_from_distinct_clients(clients: list[XOAuthClient]) -> tuple[str, str]:
     first, second = await asyncio.gather(clients[0].access_token(), clients[1].access_token())
     return first, second
+
+
+async def _exchange_while_refresh_is_in_flight(
+    session_factory: sessionmaker[Session],
+) -> tuple[str, OAuthTokenSet, OAuthTokenSet | None]:
+    refresh_started = asyncio.Event()
+    finish_refresh = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        grant_type = _form(request)["grant_type"]
+        if grant_type == ["refresh_token"]:
+            refresh_started.set()
+            await finish_refresh.wait()
+            return httpx.Response(
+                200,
+                json=_token_payload(
+                    access_token="stale-refreshed-access",
+                    refresh_token="stale-refreshed-refresh",
+                ),
+            )
+        return httpx.Response(
+            200,
+            json=_token_payload(
+                access_token="authorized-access",
+                refresh_token="authorized-refresh",
+            ),
+        )
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    service = XOAuthClient(
+        session_factory=session_factory,
+        client_id="test-client-id",
+        redirect_uri="https://reader.test/api/x/callback",
+        encryption_key=FERNET_KEY,
+        http_client=http_client,
+        clock=lambda: NOW + timedelta(minutes=59),
+        token_url=TOKEN_URL,
+    )
+    refresh_task = asyncio.create_task(service.access_token())
+    await refresh_started.wait()
+    try:
+        authorized = await service.exchange_code(
+            code="new-authorization-code",
+            verifier="new-authorization-verifier",
+        )
+    finally:
+        finish_refresh.set()
+    try:
+        refresh_result = await refresh_task
+    finally:
+        await http_client.aclose()
+    with session_factory() as session:
+        stored = TokenVault(session=session, encryption_key=FERNET_KEY).load(provider="x")
+    return refresh_result, authorized, stored
 
 
 @pytest.mark.parametrize(

@@ -13,6 +13,7 @@ from x_digest.services.oauth_tokens import OAuthTokenSet, TokenVault
 X_PROVIDER = "x"
 DEFAULT_TOKEN_URL = "https://api.x.com/2/oauth2/token"
 _PROCESS_REFRESH_LOCK = asyncio.Lock()
+_PROCESS_CREDENTIAL_WRITE_LOCK = asyncio.Lock()
 
 type Clock = Callable[[], datetime]
 type OAuthCredentialView = OAuthTokenSet
@@ -66,10 +67,11 @@ class XOAuthClient:
                 "code_verifier": verifier,
             }
         )
-        with self._session_factory.begin() as session:
-            vault = self._vault(session)
-            self._store(vault, payload)
-            credential = self._load(vault)
+        async with _PROCESS_CREDENTIAL_WRITE_LOCK:
+            with self._session_factory.begin() as session:
+                vault = self._vault(session)
+                self._store(vault, payload)
+                credential = self._load(vault)
         if credential is None:  # pragma: no cover - store guarantees a row
             raise _invalid_token_error()
         return credential
@@ -85,27 +87,37 @@ class XOAuthClient:
                 return credential.access_token
 
         async with _PROCESS_REFRESH_LOCK:
-            with self._session_factory.begin() as session:
-                vault = self._vault(session)
-                credential = self._load(vault)
-                if credential is None:
-                    raise _authorization_error()
-                if not self._needs_refresh(vault):
-                    return credential.access_token
+            async with _PROCESS_CREDENTIAL_WRITE_LOCK:
+                with self._session_factory.begin() as session:
+                    vault = self._vault(session)
+                    credential = self._load(vault)
+                    if credential is None:
+                        raise _authorization_error()
+                    if not self._needs_refresh(vault):
+                        return credential.access_token
 
-                client_id, _redirect_uri = self._configuration()
-                payload = await self._request_tokens(
-                    {
-                        "grant_type": "refresh_token",
-                        "client_id": client_id,
-                        "refresh_token": credential.refresh_token,
-                    }
-                )
-                self._store(vault, payload)
-                refreshed = self._load(vault)
-                if refreshed is None:  # pragma: no cover - store guarantees a row
-                    raise _invalid_token_error()
-                return refreshed.access_token
+            client_id, _redirect_uri = self._configuration()
+            payload = await self._request_tokens(
+                {
+                    "grant_type": "refresh_token",
+                    "client_id": client_id,
+                    "refresh_token": credential.refresh_token,
+                }
+            )
+
+            async with _PROCESS_CREDENTIAL_WRITE_LOCK:
+                with self._session_factory.begin() as session:
+                    vault = self._vault(session)
+                    current = self._load(vault)
+                    if current is None:
+                        raise _authorization_error()
+                    if current != credential or not self._needs_refresh(vault):
+                        return current.access_token
+                    self._store(vault, payload)
+                    refreshed = self._load(vault)
+                    if refreshed is None:  # pragma: no cover - store guarantees a row
+                        raise _invalid_token_error()
+                    return refreshed.access_token
 
     def _configuration(self) -> tuple[str, str]:
         if not self._client_id or not self._redirect_uri or self._encryption_key is None:
