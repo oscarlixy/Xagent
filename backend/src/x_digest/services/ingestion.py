@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
@@ -7,8 +8,29 @@ from sqlalchemy.orm import Session, sessionmaker
 from x_digest.models import SyncRun, XList
 from x_digest.repositories.jobs import advance_list_watermark, begin_sync_run, finish_sync_run
 from x_digest.repositories.posts import AuthorInput, PostInput, attach_to_list, upsert_post
+from x_digest.services.oauth_client import OAuthClientError
 from x_digest.sources.base import XSource
+from x_digest.sources.errors import XSourceError
 from x_digest.sources.types import RawPost
+
+_SAFE_SOURCE_ERROR_CODES = frozenset(
+    {
+        "x_authorization_failed",
+        "x_rate_limited",
+        "x_upstream_unavailable",
+        "x_response_invalid",
+        "x_request_invalid",
+    }
+)
+_SAFE_OAUTH_ERROR_CODES = frozenset(
+    {
+        "oauth_not_configured",
+        "oauth_authorization_failed",
+        "oauth_upstream_unavailable",
+        "oauth_token_invalid",
+    }
+)
+_GENERIC_FAILURE_CODE = "ingestion_failed"
 
 
 @dataclass(frozen=True)
@@ -60,20 +82,27 @@ class IngestionService:
                     x_list = session.get(XList, list_id)
                     if x_list is None:  # pragma: no cover - list deletion is externally coordinated
                         raise ValueError(f"Unknown List: {list_id}")
-                    result.pages_fetched += 1
-                    result.rejected += len(page.rejected_items)
+                    page_result = _MutableSyncResult(run_id=run_id, pages_fetched=1)
+                    page_result.rejected = len(page.rejected_items)
+                    if page_result.rejected:
+                        page_result.status = "partial"
                     for raw_post in page.posts:
-                        if result.posts_seen >= self._max_posts:
+                        if result.posts_seen + page_result.posts_seen >= self._max_posts:
                             break
-                        self._store_post(session, x_list, raw_post, result)
+                        self._store_post(session, x_list, raw_post, page_result)
+                    candidate = _merge_results(result, page_result)
                     durable_run = session.get(SyncRun, run_id)
                     if durable_run is not None:  # pragma: no branch - the run was just created
-                        self._record_counts(durable_run, result)
+                        self._record_counts(durable_run, candidate)
+                result = candidate
                 if page.next_token is None:
                     break
                 pagination_token = page.next_token
-        except Exception:
-            self._finish_failed_run(result)
+        except asyncio.CancelledError:
+            self._finish_failed_run(result, error_code=_GENERIC_FAILURE_CODE)
+            raise
+        except Exception as error:
+            self._finish_failed_run(result, error_code=_safe_failure_code(error))
             raise
 
         with self._session_factory.begin() as session:
@@ -82,7 +111,7 @@ class IngestionService:
             if x_list is None or durable_run is None:
                 raise ValueError(f"Unknown List: {list_id}")
             finish_sync_run(session, sync_run=durable_run, status=result.status)
-            if result.latest_seen_at is not None:
+            if result.status == "succeeded" and result.latest_seen_at is not None:
                 advance_list_watermark(
                     session,
                     x_list=x_list,
@@ -101,12 +130,13 @@ class IngestionService:
                 rejected=result.rejected,
             )
 
-    def _finish_failed_run(self, result: "_MutableSyncResult") -> None:
+    def _finish_failed_run(self, result: "_MutableSyncResult", *, error_code: str) -> None:
         with self._session_factory.begin() as session:
             sync_run = session.get(SyncRun, result.run_id)
             if sync_run is None:  # pragma: no cover - run is created before fetching pages
                 return
             finish_sync_run(session, sync_run=sync_run, status="failed")
+            sync_run.error_code = error_code
             self._record_counts(sync_run, result)
 
     @staticmethod
@@ -164,3 +194,34 @@ class _MutableSyncResult:
     rejected: int = 0
     latest_seen_at: datetime | None = None
     latest_seen_post_id: str | None = None
+
+
+def _merge_results(result: _MutableSyncResult, page: _MutableSyncResult) -> _MutableSyncResult:
+    latest_seen_at = result.latest_seen_at
+    latest_seen_post_id = result.latest_seen_post_id
+    if page.latest_seen_at is not None and (
+        latest_seen_at is None
+        or (page.latest_seen_at, page.latest_seen_post_id or "")
+        > (latest_seen_at, latest_seen_post_id or "")
+    ):
+        latest_seen_at = page.latest_seen_at
+        latest_seen_post_id = page.latest_seen_post_id
+    return _MutableSyncResult(
+        run_id=result.run_id,
+        status="partial" if "partial" in {result.status, page.status} else "succeeded",
+        pages_fetched=result.pages_fetched + page.pages_fetched,
+        posts_seen=result.posts_seen + page.posts_seen,
+        posts_created=result.posts_created + page.posts_created,
+        duplicates=result.duplicates + page.duplicates,
+        rejected=result.rejected + page.rejected,
+        latest_seen_at=latest_seen_at,
+        latest_seen_post_id=latest_seen_post_id,
+    )
+
+
+def _safe_failure_code(error: Exception) -> str:
+    if isinstance(error, XSourceError) and error.code in _SAFE_SOURCE_ERROR_CODES:
+        return error.code
+    if isinstance(error, OAuthClientError) and error.code in _SAFE_OAUTH_ERROR_CODES:
+        return error.code
+    return _GENERIC_FAILURE_CODE

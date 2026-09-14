@@ -1,14 +1,17 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import sessionmaker
 
-from x_digest.models import Base, Post, XList
+from x_digest.models import Base, Post, SyncRun, XList
 from x_digest.repositories.lists import upsert_list
 from x_digest.services.ingestion import IngestionService
+from x_digest.services.oauth_client import OAuthClientError
+from x_digest.sources.errors import AuthenticationError, RateLimitError, UpstreamError
 from x_digest.sources.fake import FakeXSource
-from x_digest.sources.types import RawAuthor, RawPost, SourcePage
+from x_digest.sources.types import RawAuthor, RawPost, RejectedItem, SourcePage
 
 
 def test_fake_source_sync_is_idempotent_and_advances_watermark() -> None:
@@ -94,3 +97,179 @@ def test_source_fetch_happens_outside_an_active_database_transaction() -> None:
 
     assert result.status == "succeeded"
     assert result.pages_fetched == 1
+
+
+def test_cancelled_source_finalizes_the_durable_run_as_failed_without_watermark() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(engine)
+    with session_factory.begin() as session:
+        x_list = upsert_list(session, platform_list_id="123456789", name="AI news")
+        list_id = x_list.id
+
+    class CancelledSource:
+        async def fetch_page(
+            self, *, list_id: str, pagination_token: str | None, max_results: int
+        ) -> SourcePage:
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            IngestionService(
+                session_factory=session_factory, source=CancelledSource()
+            ).sync_list(list_id)
+        )
+
+    with session_factory() as session:
+        run = session.scalar(select(SyncRun))
+        x_list = session.get(XList, list_id)
+        assert run is not None
+        assert x_list is not None
+        assert run.status == "failed"
+        assert run.finished_at is not None
+        assert run.error_code == "ingestion_failed"
+        assert x_list.latest_seen_at is None
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_code"),
+    [
+        (AuthenticationError(), "x_authorization_failed"),
+        (RateLimitError(), "x_rate_limited"),
+        (UpstreamError(), "x_upstream_unavailable"),
+        (
+            OAuthClientError(503, "oauth_upstream_unavailable", "provider body test-access-token"),
+            "oauth_upstream_unavailable",
+        ),
+        (RuntimeError("provider body test-access-token"), "ingestion_failed"),
+    ],
+)
+def test_failed_source_persists_only_safe_error_codes(
+    error: Exception, expected_code: str
+) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(engine)
+    with session_factory.begin() as session:
+        x_list = upsert_list(session, platform_list_id="123456789", name="AI news")
+        list_id = x_list.id
+
+    class FailingSource:
+        async def fetch_page(
+            self, *, list_id: str, pagination_token: str | None, max_results: int
+        ) -> SourcePage:
+            raise error
+
+    with pytest.raises(type(error)):
+        asyncio.run(
+            IngestionService(
+                session_factory=session_factory, source=FailingSource()
+            ).sync_list(list_id)
+        )
+
+    with session_factory() as session:
+        run = session.scalar(select(SyncRun))
+        assert run is not None
+        assert run.status == "failed"
+        assert run.finished_at is not None
+        assert run.error_code == expected_code
+        assert "test-access-token" not in str(run.debug_metadata)
+
+
+def test_rolled_back_page_does_not_inflate_durable_run_counts() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(engine)
+    now = datetime.now(UTC)
+    with session_factory.begin() as session:
+        x_list = upsert_list(session, platform_list_id="123456789", name="AI news")
+        list_id = x_list.id
+
+    commits = 0
+
+    def fail_page_commit(*_args: object) -> None:
+        nonlocal commits
+        commits += 1
+        if commits == 2:
+            raise RuntimeError("forced page commit rollback")
+
+    event.listen(engine, "commit", fail_page_commit)
+    source = FakeXSource(
+        {
+            None: SourcePage(
+                posts=(
+                    RawPost(
+                        id="101",
+                        author=RawAuthor(id="author-1", username="author"),
+                        text="first post",
+                        created_at=now,
+                        source_url="https://x.com/author/status/101",
+                    ),
+                )
+            )
+        }
+    )
+    try:
+        with pytest.raises(RuntimeError, match="forced page commit rollback"):
+            asyncio.run(
+                IngestionService(session_factory=session_factory, source=source).sync_list(list_id)
+            )
+    finally:
+        event.remove(engine, "commit", fail_page_commit)
+
+    with session_factory() as session:
+        run = session.scalar(select(SyncRun))
+        x_list = session.get(XList, list_id)
+        assert run is not None
+        assert x_list is not None
+        assert run.status == "failed"
+        assert (run.pages_fetched, run.posts_seen, run.posts_created, run.duplicates) == (
+            0,
+            0,
+            0,
+            0,
+        )
+        assert x_list.latest_seen_at is None
+        assert session.scalars(select(Post)).all() == []
+
+
+def test_rejected_page_is_partial_and_does_not_advance_the_watermark() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(engine)
+    now = datetime.now(UTC)
+    with session_factory.begin() as session:
+        x_list = upsert_list(session, platform_list_id="123456789", name="AI news")
+        list_id = x_list.id
+
+    source = FakeXSource(
+        {
+            None: SourcePage(
+                posts=(
+                    RawPost(
+                        id="101",
+                        author=RawAuthor(id="author-1", username="author"),
+                        text="first post",
+                        created_at=now,
+                        source_url="https://x.com/author/status/101",
+                    ),
+                ),
+                rejected_items=(RejectedItem(identifier="102", reason="provider_rejected"),),
+            )
+        }
+    )
+
+    result = asyncio.run(
+        IngestionService(session_factory=session_factory, source=source).sync_list(list_id)
+    )
+
+    with session_factory() as session:
+        run = session.scalar(select(SyncRun))
+        x_list = session.get(XList, list_id)
+        assert run is not None
+        assert x_list is not None
+        assert result.status == "partial"
+        assert result.rejected == 1
+        assert run.status == "partial"
+        assert run.rejected == 1
+        assert x_list.latest_seen_at is None
