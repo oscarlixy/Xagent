@@ -1,23 +1,19 @@
+import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
 
 import {
   createOAuthState,
   OAUTH_STATE_COOKIE,
   OAUTH_STATE_MAX_AGE,
-  validStateSecret,
 } from "../../../../lib/oauth-state";
+import {
+  configuredHttpUrlForProvider,
+  oauthConfiguration,
+  requestOrigin,
+} from "../../../../lib/oauth-config";
 
 const DEFAULT_AUTHORIZE_URL = "https://x.com/i/oauth2/authorize";
 const OAUTH_SCOPE = "tweet.read users.read list.read offline.access";
-
-function configuredUrl(value: string | undefined): URL | null {
-  try {
-    const url = new URL(value ?? "");
-    return url.protocol === "http:" || url.protocol === "https:" ? url : null;
-  } catch {
-    return null;
-  }
-}
 
 function unavailable(): NextResponse {
   return NextResponse.json(
@@ -26,19 +22,18 @@ function unavailable(): NextResponse {
   );
 }
 
-export async function GET(): Promise<NextResponse> {
-  const clientId = process.env.X_CLIENT_ID?.trim();
-  const redirectUri = configuredUrl(process.env.X_OAUTH_REDIRECT_URI);
-  const stateSecret = process.env.X_OAUTH_STATE_SECRET;
-  const authorizeUrl = configuredUrl(process.env.X_OAUTH_AUTHORIZE_URL ?? DEFAULT_AUTHORIZE_URL);
-  if (!clientId || !redirectUri || !validStateSecret(stateSecret) || !authorizeUrl) {
+export async function GET(request: NextRequest): Promise<NextResponse> {
+  const origin = requestOrigin(request.nextUrl.protocol, request.headers.get("host"));
+  const config = origin ? oauthConfiguration(origin) : null;
+  const authorizeUrl = configuredHttpUrlForProvider(process.env.X_OAUTH_AUTHORIZE_URL ?? DEFAULT_AUTHORIZE_URL);
+  if (!config || !authorizeUrl) {
     return unavailable();
   }
 
-  const oauthState = await createOAuthState(stateSecret);
+  const oauthState = await createOAuthState(config.stateSecret);
   authorizeUrl.search = "";
-  authorizeUrl.searchParams.set("client_id", clientId);
-  authorizeUrl.searchParams.set("redirect_uri", redirectUri.toString());
+  authorizeUrl.searchParams.set("client_id", config.clientId);
+  authorizeUrl.searchParams.set("redirect_uri", config.redirectUri.toString());
   authorizeUrl.searchParams.set("response_type", "code");
   authorizeUrl.searchParams.set("scope", OAUTH_SCOPE);
   authorizeUrl.searchParams.set("state", oauthState.payload.state);

@@ -226,7 +226,7 @@ test("rejects missing, tampered, and expired OAuth state without leaking inputs"
     const response = await request.get(
       `/api/x/callback?code=${encodeURIComponent(scenario.code)}&state=${encodeURIComponent(scenario.state)}`,
       {
-        headers: scenario.cookie ? { Cookie: scenario.cookie } : undefined,
+        headers: { Cookie: scenario.cookie ?? "" },
         maxRedirects: 0,
       },
     );

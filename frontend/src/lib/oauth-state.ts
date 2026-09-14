@@ -41,6 +41,17 @@ export function validStateSecret(secret: string | undefined): secret is string {
   return typeof secret === "string" && encoder.encode(secret).byteLength >= 32;
 }
 
+export function constantTimeEqual(actual: string, expected: string): boolean {
+  const actualBytes = encoder.encode(actual);
+  const expectedBytes = encoder.encode(expected);
+  const length = Math.max(actualBytes.byteLength, expectedBytes.byteLength);
+  let difference = actualBytes.byteLength ^ expectedBytes.byteLength;
+  for (let index = 0; index < length; index += 1) {
+    difference |= (actualBytes[index] ?? 0) ^ (expectedBytes[index] ?? 0);
+  }
+  return difference === 0;
+}
+
 export async function createOAuthState(secret: string): Promise<{
   cookie: string;
   payload: OAuthState;

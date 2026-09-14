@@ -1,44 +1,14 @@
 import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
 
-import { OAUTH_STATE_COOKIE, validStateSecret, verifyOAuthState } from "../../../../lib/oauth-state";
+import {
+  oauthConfiguration,
+  requestOrigin,
+  type OAuthConfiguration,
+} from "../../../../lib/oauth-config";
+import { constantTimeEqual, OAUTH_STATE_COOKIE, verifyOAuthState } from "../../../../lib/oauth-state";
 
 const TIMEOUT_MS = 8_000;
-
-type CallbackConfig = {
-  backendUrl: URL;
-  internalToken: string;
-  redirectUri: URL;
-  stateSecret: string;
-};
-
-function configuredUrl(value: string | undefined): URL | null {
-  try {
-    const url = new URL(value ?? "");
-    return url.protocol === "http:" || url.protocol === "https:" ? url : null;
-  } catch {
-    return null;
-  }
-}
-
-function configuration(): CallbackConfig | null {
-  const clientId = process.env.X_CLIENT_ID?.trim();
-  const redirectUri = configuredUrl(process.env.X_OAUTH_REDIRECT_URI);
-  const stateSecret = process.env.X_OAUTH_STATE_SECRET;
-  const backendUrl = configuredUrl(process.env.BACKEND_INTERNAL_URL);
-  const internalToken = process.env.INTERNAL_API_TOKEN;
-  if (
-    !clientId ||
-    !redirectUri ||
-    !validStateSecret(stateSecret) ||
-    !backendUrl ||
-    !internalToken ||
-    new TextEncoder().encode(internalToken).byteLength < 32
-  ) {
-    return null;
-  }
-  return { backendUrl, internalToken, redirectUri, stateSecret };
-}
 
 function clearState(response: NextResponse): NextResponse {
   response.cookies.set(OAUTH_STATE_COOKIE, "", {
@@ -60,19 +30,20 @@ function unavailable(): NextResponse {
   );
 }
 
-function redirect(config: CallbackConfig, outcome: "success" | "failed" | "denied"): NextResponse {
+function redirect(config: OAuthConfiguration, outcome: "success" | "failed" | "denied"): NextResponse {
   const target = new URL("/", config.redirectUri);
   if (outcome !== "success") target.searchParams.set("x_auth", outcome);
   return clearState(NextResponse.redirect(target, 307));
 }
 
 export async function GET(request: NextRequest): Promise<NextResponse> {
-  const config = configuration();
+  const origin = requestOrigin(request.nextUrl.protocol, request.headers.get("host"));
+  const config = origin ? oauthConfiguration(origin) : null;
   if (!config) return unavailable();
 
   const suppliedState = request.nextUrl.searchParams.get("state");
   const storedState = await verifyOAuthState(request.cookies.get(OAUTH_STATE_COOKIE)?.value, config.stateSecret);
-  if (!storedState || !suppliedState || suppliedState !== storedState.state) {
+  if (!storedState || !suppliedState || !constantTimeEqual(suppliedState, storedState.state)) {
     return redirect(config, "failed");
   }
 
