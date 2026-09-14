@@ -4,7 +4,7 @@ from typing import Literal
 
 from sqlalchemy.orm import Session, sessionmaker
 
-from x_digest.models import XList
+from x_digest.models import SyncRun, XList
 from x_digest.repositories.jobs import advance_list_watermark, begin_sync_run, finish_sync_run
 from x_digest.repositories.posts import AuthorInput, PostInput, attach_to_list, upsert_post
 from x_digest.sources.base import XSource
@@ -37,28 +37,62 @@ class IngestionService:
         self._max_posts = max_posts
 
     async def sync_list(self, list_id: str) -> SyncResult:
-        with self._session_factory.begin() as session:
+        with self._session_factory() as session:
             x_list = session.get(XList, list_id)
             if x_list is None:
                 raise ValueError(f"Unknown List: {list_id}")
+            platform_list_id = x_list.platform_list_id
+
+        with self._session_factory.begin() as session:
             sync_run = begin_sync_run(session, list_id=list_id)
-            result = await self._ingest_pages(session, x_list, sync_run.id)
-            finish_sync_run(session, sync_run=sync_run, status=result.status)
-            if result.status == "succeeded" and result.latest_seen_at is not None:
+            run_id = sync_run.id
+
+        result = _MutableSyncResult(run_id=run_id)
+        pagination_token: str | None = None
+        try:
+            while result.pages_fetched < self._max_pages and result.posts_seen < self._max_posts:
+                page = await self._source.fetch_page(
+                    list_id=platform_list_id,
+                    pagination_token=pagination_token,
+                    max_results=min(100, self._max_posts - result.posts_seen),
+                )
+                with self._session_factory.begin() as session:
+                    x_list = session.get(XList, list_id)
+                    if x_list is None:  # pragma: no cover - list deletion is externally coordinated
+                        raise ValueError(f"Unknown List: {list_id}")
+                    result.pages_fetched += 1
+                    result.rejected += len(page.rejected_items)
+                    for raw_post in page.posts:
+                        if result.posts_seen >= self._max_posts:
+                            break
+                        self._store_post(session, x_list, raw_post, result)
+                    durable_run = session.get(SyncRun, run_id)
+                    if durable_run is not None:  # pragma: no branch - the run was just created
+                        self._record_counts(durable_run, result)
+                if page.next_token is None:
+                    break
+                pagination_token = page.next_token
+        except Exception:
+            self._finish_failed_run(result)
+            raise
+
+        with self._session_factory.begin() as session:
+            x_list = session.get(XList, list_id)
+            durable_run = session.get(SyncRun, run_id)
+            if x_list is None or durable_run is None:
+                raise ValueError(f"Unknown List: {list_id}")
+            finish_sync_run(session, sync_run=durable_run, status=result.status)
+            if result.latest_seen_at is not None:
                 advance_list_watermark(
                     session,
                     x_list=x_list,
-                    sync_run=sync_run,
+                    sync_run=durable_run,
                     latest_seen_at=result.latest_seen_at,
                     latest_seen_post_id=result.latest_seen_post_id or "",
                 )
-            sync_run.pages_fetched = result.pages_fetched
-            sync_run.posts_seen = result.posts_seen
-            sync_run.posts_created = result.posts_created
-            sync_run.duplicates = result.duplicates
-            sync_run.rejected = result.rejected
+            self._record_counts(durable_run, result)
             return SyncResult(
-                run_id=sync_run.id,
+                run_id=run_id,
                 status=result.status,
                 pages_fetched=result.pages_fetched,
                 posts_seen=result.posts_seen,
@@ -67,27 +101,21 @@ class IngestionService:
                 rejected=result.rejected,
             )
 
-    async def _ingest_pages(
-        self, session: Session, x_list: XList, run_id: str
-    ) -> "_MutableSyncResult":
-        result = _MutableSyncResult(run_id=run_id)
-        pagination_token: str | None = None
-        while result.pages_fetched < self._max_pages and result.posts_seen < self._max_posts:
-            page = await self._source.fetch_page(
-                list_id=x_list.platform_list_id,
-                pagination_token=pagination_token,
-                max_results=min(100, self._max_posts - result.posts_seen),
-            )
-            result.pages_fetched += 1
-            result.rejected += len(page.rejected_items)
-            for raw_post in page.posts:
-                if result.posts_seen >= self._max_posts:
-                    break
-                self._store_post(session, x_list, raw_post, result)
-            if page.next_token is None:
-                break
-            pagination_token = page.next_token
-        return result
+    def _finish_failed_run(self, result: "_MutableSyncResult") -> None:
+        with self._session_factory.begin() as session:
+            sync_run = session.get(SyncRun, result.run_id)
+            if sync_run is None:  # pragma: no cover - run is created before fetching pages
+                return
+            finish_sync_run(session, sync_run=sync_run, status="failed")
+            self._record_counts(sync_run, result)
+
+    @staticmethod
+    def _record_counts(sync_run: SyncRun, result: "_MutableSyncResult") -> None:
+        sync_run.pages_fetched = result.pages_fetched
+        sync_run.posts_seen = result.posts_seen
+        sync_run.posts_created = result.posts_created
+        sync_run.duplicates = result.duplicates
+        sync_run.rejected = result.rejected
 
     @staticmethod
     def _store_post(

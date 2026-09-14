@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from x_digest.config import Settings  # noqa: E402
 from x_digest.services.oauth_client import XOAuthClient  # noqa: E402
 from x_digest.sources.errors import XSourceError  # noqa: E402
-from x_digest.sources.x_api import XApiSource  # noqa: E402
+from x_digest.sources.x_api import XApiSource, is_valid_x_list_id  # noqa: E402
 
 
 def _build_source(settings: Settings) -> tuple[XApiSource, XOAuthClient]:
@@ -45,6 +45,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not args.confirm:
         parser.error("--confirm is required before making an X request")
+    if not is_valid_x_list_id(args.list_id):
+        parser.error("--list-id must be a numeric X List ID")
 
     source: XApiSource | None = None
     client: XOAuthClient | None = None

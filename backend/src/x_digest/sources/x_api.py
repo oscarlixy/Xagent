@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import math
+import re
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -18,6 +20,7 @@ from x_digest.sources.types import RawAuthor, RawPost, RejectedItem, SourcePage
 
 DEFAULT_X_API_BASE_URL = "https://api.x.com/2"
 MAX_RETRY_DELAY_SECONDS = 60.0
+LIST_ID_PATTERN = re.compile(r"^[0-9]{1,19}$")
 
 type Sleeper = Callable[[float], Awaitable[None]]
 
@@ -54,7 +57,7 @@ class XApiSource:
     async def fetch_page(
         self, *, list_id: str, pagination_token: str | None, max_results: int
     ) -> SourcePage:
-        if not list_id or not 1 <= max_results <= 100:
+        if not is_valid_x_list_id(list_id) or not 1 <= max_results <= 100:
             raise InvalidRequestError()
         access_token = await self._token_service.access_token()
         params = {
@@ -106,10 +109,16 @@ def _retry_after_delay(response: httpx.Response, attempt: int) -> float:
     retry_after = response.headers.get("retry-after")
     if retry_after is not None:
         try:
-            return min(max(float(retry_after), 0.0), MAX_RETRY_DELAY_SECONDS)
+            delay = float(retry_after)
         except ValueError:
-            pass
+            return _backoff_delay(attempt)
+        if math.isfinite(delay) and delay >= 0:
+            return min(delay, MAX_RETRY_DELAY_SECONDS)
     return _backoff_delay(attempt)
+
+
+def is_valid_x_list_id(value: str) -> bool:
+    return LIST_ID_PATTERN.fullmatch(value) is not None
 
 
 def _parse_page(response: httpx.Response, *, request_id: str | None) -> SourcePage:
@@ -120,7 +129,7 @@ def _parse_page(response: httpx.Response, *, request_id: str | None) -> SourcePa
     if not isinstance(payload, Mapping):
         raise InvalidResponseError(request_id=request_id)
 
-    data = payload.get("data")
+    data = payload.get("data", [])
     if not isinstance(data, list):
         raise InvalidResponseError(request_id=request_id)
     users = _users_by_id(payload.get("includes"), request_id=request_id)

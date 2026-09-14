@@ -23,7 +23,7 @@ class ErrorResponse(StrictModel):
 
 
 class ListCreate(StrictModel):
-    platform_list_id: str = Field(min_length=1, max_length=32)
+    platform_list_id: str = Field(pattern=r"^[0-9]{1,19}$")
     name: str = Field(min_length=1, max_length=255)
     sync_interval_minutes: int = Field(default=1440, ge=1, le=525_600)
     enabled: bool = True

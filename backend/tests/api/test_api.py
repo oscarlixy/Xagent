@@ -186,7 +186,7 @@ def test_list_crud_validates_input_and_missing_resources(api) -> None:
         "/api/lists",
         headers=AUTH,
         json={
-            "platform_list_id": "list-new",
+            "platform_list_id": "123456789",
             "name": "Research",
             "sync_interval_minutes": 30,
             "enabled": True,
@@ -210,6 +210,13 @@ def test_list_crud_validates_input_and_missing_resources(api) -> None:
         json={"platform_list_id": "", "name": "", "sync_interval_minutes": 0},
     )
     assert invalid.status_code == 422
+    for invalid_list_id in ["../../users/me", "123?max_results=100", "123#fragment"]:
+        rejected = client.post(
+            "/api/lists",
+            headers=AUTH,
+            json={"platform_list_id": invalid_list_id, "name": "Research"},
+        )
+        assert rejected.status_code == 422
     assert client.patch(f"/api/lists/{list_id}", headers=AUTH, json={}).status_code == 422
     assert (
         client.patch(f"/api/lists/{list_id}", headers=AUTH, json={"name": None}).status_code == 422
