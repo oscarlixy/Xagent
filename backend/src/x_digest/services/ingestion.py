@@ -1,8 +1,9 @@
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Literal
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from x_digest.models import SyncRun, XList
@@ -31,6 +32,7 @@ _SAFE_OAUTH_ERROR_CODES = frozenset(
     }
 )
 _GENERIC_FAILURE_CODE = "ingestion_failed"
+STALE_RUNNING_RUN_THRESHOLD = timedelta(hours=1)
 
 
 @dataclass(frozen=True)
@@ -65,6 +67,7 @@ class IngestionService:
                 raise ValueError(f"Unknown List: {list_id}")
             platform_list_id = x_list.platform_list_id
 
+        self._reconcile_stale_runs(list_id)
         with self._session_factory.begin() as session:
             sync_run = begin_sync_run(session, list_id=list_id)
             run_id = sync_run.id
@@ -99,15 +102,25 @@ class IngestionService:
                     break
                 pagination_token = page.next_token
         except asyncio.CancelledError:
-            self._finish_failed_run(result, error_code=_GENERIC_FAILURE_CODE)
+            self._best_effort_finish_failed(result, error_code=_GENERIC_FAILURE_CODE)
             raise
         except Exception as error:
-            self._finish_failed_run(result, error_code=_safe_failure_code(error))
+            self._best_effort_finish_failed(result, error_code=_safe_failure_code(error))
             raise
 
+        try:
+            return self._complete_run(list_id, result)
+        except asyncio.CancelledError:
+            self._best_effort_finish_failed(result, error_code=_GENERIC_FAILURE_CODE)
+            raise
+        except Exception as error:
+            self._best_effort_finish_failed(result, error_code=_safe_failure_code(error))
+            raise
+
+    def _complete_run(self, list_id: str, result: "_MutableSyncResult") -> SyncResult:
         with self._session_factory.begin() as session:
             x_list = session.get(XList, list_id)
-            durable_run = session.get(SyncRun, run_id)
+            durable_run = session.get(SyncRun, result.run_id)
             if x_list is None or durable_run is None:
                 raise ValueError(f"Unknown List: {list_id}")
             finish_sync_run(session, sync_run=durable_run, status=result.status)
@@ -121,7 +134,7 @@ class IngestionService:
                 )
             self._record_counts(durable_run, result)
             return SyncResult(
-                run_id=run_id,
+                run_id=result.run_id,
                 status=result.status,
                 pages_fetched=result.pages_fetched,
                 posts_seen=result.posts_seen,
@@ -129,6 +142,28 @@ class IngestionService:
                 duplicates=result.duplicates,
                 rejected=result.rejected,
             )
+
+    def _reconcile_stale_runs(self, list_id: str) -> None:
+        cutoff = datetime.now() - STALE_RUNNING_RUN_THRESHOLD
+        with self._session_factory.begin() as session:
+            stale_runs = session.scalars(
+                select(SyncRun).where(
+                    SyncRun.list_id == list_id,
+                    SyncRun.status == "running",
+                    SyncRun.started_at <= cutoff,
+                )
+            ).all()
+            for sync_run in stale_runs:
+                finish_sync_run(session, sync_run=sync_run, status="failed")
+                sync_run.error_code = _GENERIC_FAILURE_CODE
+
+    def _best_effort_finish_failed(
+        self, result: "_MutableSyncResult", *, error_code: str
+    ) -> None:
+        try:
+            self._finish_failed_run(result, error_code=error_code)
+        except BaseException:
+            return
 
     def _finish_failed_run(self, result: "_MutableSyncResult", *, error_code: str) -> None:
         with self._session_factory.begin() as session:

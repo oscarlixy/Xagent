@@ -2,10 +2,10 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import create_engine, event, select
+from sqlalchemy import create_engine, delete, event, select
 from sqlalchemy.orm import sessionmaker
 
-from x_digest.models import Base, Post, SyncRun, XList
+from x_digest.models import Base, Post, PostListMembership, SyncRun, XList
 from x_digest.repositories.lists import upsert_list
 from x_digest.services.ingestion import IngestionService
 from x_digest.services.oauth_client import OAuthClientError
@@ -190,7 +190,7 @@ def test_rolled_back_page_does_not_inflate_durable_run_counts() -> None:
     def fail_page_commit(*_args: object) -> None:
         nonlocal commits
         commits += 1
-        if commits == 2:
+        if commits == 3:
             raise RuntimeError("forced page commit rollback")
 
     event.listen(engine, "commit", fail_page_commit)
@@ -273,3 +273,177 @@ def test_rejected_page_is_partial_and_does_not_advance_the_watermark() -> None:
         assert run.status == "partial"
         assert run.rejected == 1
         assert x_list.latest_seen_at is None
+
+
+def test_final_completion_commit_failure_marks_the_durable_run_failed() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(engine)
+    now = datetime.now(UTC)
+    with session_factory.begin() as session:
+        x_list = upsert_list(session, platform_list_id="123456789", name="AI news")
+        list_id = x_list.id
+
+    def fail_final_completion(session: object) -> None:
+        dirty = getattr(session, "dirty")
+        if any(
+            isinstance(value, SyncRun) and value.status in {"succeeded", "partial"}
+            for value in dirty
+        ):
+            raise RuntimeError("forced final completion rollback")
+
+    event.listen(session_factory.class_, "before_commit", fail_final_completion)
+    source = FakeXSource({None: _single_post_page(now)})
+    try:
+        with pytest.raises(RuntimeError, match="forced final completion rollback"):
+            asyncio.run(
+                IngestionService(
+                    session_factory=session_factory, source=source
+                ).sync_list(list_id)
+            )
+    finally:
+        event.remove(session_factory.class_, "before_commit", fail_final_completion)
+
+    with session_factory() as session:
+        run = session.scalar(select(SyncRun))
+        x_list = session.get(XList, list_id)
+        assert run is not None
+        assert x_list is not None
+        assert run.status == "failed"
+        assert run.finished_at is not None
+        assert run.error_code == "ingestion_failed"
+        assert (run.pages_fetched, run.posts_created) == (1, 1)
+        assert x_list.latest_seen_at is None
+
+
+def test_missing_list_during_completion_marks_the_durable_run_failed() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(engine)
+    now = datetime.now(UTC)
+    with session_factory.begin() as session:
+        x_list = upsert_list(session, platform_list_id="123456789", name="AI news")
+        list_id = x_list.id
+
+    class DeletingCompletionService(IngestionService):
+        def _complete_run(self, list_id: str, result: object) -> object:
+            with session_factory.begin() as session:
+                x_list = session.get(XList, list_id)
+                assert x_list is not None
+                session.execute(
+                    delete(PostListMembership).where(PostListMembership.list_id == list_id)
+                )
+                session.delete(x_list)
+            return super()._complete_run(list_id, result)
+
+    with pytest.raises(ValueError, match="Unknown List"):
+        asyncio.run(
+            DeletingCompletionService(
+                session_factory=session_factory, source=FakeXSource({None: _single_post_page(now)})
+            ).sync_list(list_id)
+        )
+
+    with session_factory() as session:
+        run = session.scalar(select(SyncRun))
+        assert run is not None
+        assert run.status == "failed"
+        assert run.finished_at is not None
+        assert run.error_code == "ingestion_failed"
+
+
+def test_cancelled_completion_marks_the_durable_run_failed_and_reraises() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(engine)
+    now = datetime.now(UTC)
+    with session_factory.begin() as session:
+        x_list = upsert_list(session, platform_list_id="123456789", name="AI news")
+        list_id = x_list.id
+
+    class CancelledCompletionService(IngestionService):
+        def _complete_run(self, list_id: str, result: object) -> object:
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            CancelledCompletionService(
+                session_factory=session_factory, source=FakeXSource({None: _single_post_page(now)})
+            ).sync_list(list_id)
+        )
+
+    with session_factory() as session:
+        run = session.scalar(select(SyncRun))
+        assert run is not None
+        assert run.status == "failed"
+        assert run.finished_at is not None
+        assert run.error_code == "ingestion_failed"
+
+
+def test_later_same_list_sync_reconciles_only_stale_running_runs_after_cleanup_failure() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(engine)
+    now = datetime.now(UTC)
+    with session_factory.begin() as session:
+        x_list = upsert_list(session, platform_list_id="123456789", name="AI news")
+        list_id = x_list.id
+
+    def fail_completion_and_cleanup(session: object) -> None:
+        dirty = getattr(session, "dirty")
+        if any(
+            isinstance(value, SyncRun) and value.status in {"succeeded", "partial", "failed"}
+            for value in dirty
+        ):
+            raise RuntimeError("forced completion and cleanup rollback")
+
+    event.listen(session_factory.class_, "before_commit", fail_completion_and_cleanup)
+    try:
+        with pytest.raises(RuntimeError, match="forced completion and cleanup rollback"):
+            asyncio.run(
+                IngestionService(
+                    session_factory=session_factory,
+                    source=FakeXSource({None: _single_post_page(now)}),
+                ).sync_list(list_id)
+            )
+    finally:
+        event.remove(session_factory.class_, "before_commit", fail_completion_and_cleanup)
+
+    with session_factory.begin() as session:
+        abandoned = session.scalar(select(SyncRun))
+        assert abandoned is not None
+        assert abandoned.status == "running"
+        abandoned_id = abandoned.id
+        abandoned.started_at = datetime.now() - timedelta(hours=2)
+        active = SyncRun(list_id=list_id, status="running", started_at=datetime.now())
+        session.add(active)
+        session.flush()
+        active_id = active.id
+
+    asyncio.run(
+        IngestionService(
+            session_factory=session_factory, source=FakeXSource({None: SourcePage()})
+        ).sync_list(list_id)
+    )
+
+    with session_factory() as session:
+        abandoned = session.get(SyncRun, abandoned_id)
+        active = session.get(SyncRun, active_id)
+        assert abandoned is not None
+        assert active is not None
+        assert abandoned.status == "failed"
+        assert abandoned.error_code == "ingestion_failed"
+        assert active.status == "running"
+
+
+def _single_post_page(now: datetime) -> SourcePage:
+    return SourcePage(
+        posts=(
+            RawPost(
+                id="101",
+                author=RawAuthor(id="author-1", username="author"),
+                text="first post",
+                created_at=now,
+                source_url="https://x.com/author/status/101",
+            ),
+        )
+    )
