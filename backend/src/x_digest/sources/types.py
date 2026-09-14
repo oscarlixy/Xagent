@@ -35,3 +35,4 @@ class SourcePage:
     posts: tuple[RawPost, ...] = ()
     rejected_items: tuple[RejectedItem, ...] = ()
     next_token: str | None = None
+    request_id: str | None = None

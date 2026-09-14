@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import httpx
 from apscheduler.schedulers.blocking import BlockingScheduler  # type: ignore[import-untyped]
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -19,9 +20,10 @@ from x_digest.config import Settings
 from x_digest.models import DigestItem, XList
 from x_digest.services.digests import build_digest
 from x_digest.services.ingestion import IngestionService
+from x_digest.services.oauth_client import XOAuthClient
 from x_digest.services.pipeline import PipelineService
 from x_digest.services.summarization import DeterministicSummarizer
-from x_digest.sources.fake import FakeXSource
+from x_digest.sources.x_api import XApiSource
 
 MISFIRE_GRACE_SECONDS = 300
 RECONCILE_INTERVAL_MINUTES = 5
@@ -210,33 +212,67 @@ def _elapsed_ms(started: float) -> int:
     return int((time.monotonic() - started) * 1000)
 
 
+def build_production_pipeline(
+    settings: Settings,
+    session_factory: sessionmaker[Session],
+    *,
+    oauth_http_client: httpx.AsyncClient | None = None,
+    x_api_http_client: httpx.AsyncClient | None = None,
+) -> tuple[PipelineService, XOAuthClient, XApiSource]:
+    """Create the scheduler pipeline with the OAuth-backed production source."""
+
+    oauth_client = XOAuthClient(
+        session_factory=session_factory,
+        client_id=settings.x_client_id,
+        redirect_uri=settings.x_oauth_redirect_uri,
+        encryption_key=settings.x_token_encryption_key,
+        http_client=oauth_http_client,
+    )
+    source = XApiSource(token_service=oauth_client, http_client=x_api_http_client)
+    return (
+        PipelineService(
+            ingestion=IngestionService(
+                session_factory=session_factory,
+                source=source,
+                max_pages=settings.x_max_pages_per_sync,
+                max_posts=settings.x_max_posts_per_sync,
+            ),
+            session_factory=session_factory,
+            summarizer=DeterministicSummarizer(),
+            llm_max_items_per_run=settings.llm_max_items_per_run,
+        ),
+        oauth_client,
+        source,
+    )
+
+
 def main() -> None:
     """Run the scheduler as a dedicated foreground process."""
 
     settings = Settings()
     engine = create_engine(settings.database_url)
     session_factory = sessionmaker(engine, expire_on_commit=False)
-    pipeline = PipelineService(
-        ingestion=IngestionService(
-            session_factory=session_factory,
-            source=FakeXSource({}),
-            max_pages=settings.x_max_pages_per_sync,
-            max_posts=settings.x_max_posts_per_sync,
-        ),
-        session_factory=session_factory,
-        summarizer=DeterministicSummarizer(),
-        llm_max_items_per_run=settings.llm_max_items_per_run,
-    )
-    build_scheduler(
-        settings,
-        PipelineSchedulerServices(
-            session_factory=session_factory,
-            pipeline_runner=pipeline.run_list_pipeline,
-            digest_runner=lambda cadence: run_offline_digest(
-                session_factory, cadence, settings.app_timezone
+    pipeline, oauth_client, source = build_production_pipeline(settings, session_factory)
+    try:
+        build_scheduler(
+            settings,
+            PipelineSchedulerServices(
+                session_factory=session_factory,
+                pipeline_runner=pipeline.run_list_pipeline,
+                digest_runner=lambda cadence: run_offline_digest(
+                    session_factory, cadence, settings.app_timezone
+                ),
             ),
-        ),
-    ).start()
+        ).start()
+    finally:
+        asyncio.run(_close_production_clients(source, oauth_client))
+
+
+async def _close_production_clients(source: XApiSource, oauth_client: XOAuthClient) -> None:
+    try:
+        await source.aclose()
+    finally:
+        await oauth_client.aclose()
 
 
 if __name__ == "__main__":  # pragma: no cover

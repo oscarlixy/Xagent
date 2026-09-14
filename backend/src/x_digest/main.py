@@ -21,7 +21,7 @@ from x_digest.services.ingestion import IngestionService
 from x_digest.services.oauth_client import XOAuthClient
 from x_digest.services.pipeline import PipelineService
 from x_digest.services.summarization import DeterministicSummarizer
-from x_digest.sources.fake import FakeXSource
+from x_digest.sources.x_api import XApiSource
 
 
 def create_app(
@@ -31,6 +31,7 @@ def create_app(
     session_factory: sessionmaker[Session] | None = None,
     pipeline_service: PipelineRunner | None = None,
     oauth_http_client: httpx.AsyncClient | None = None,
+    x_api_http_client: httpx.AsyncClient | None = None,
     oauth_clock: Callable[[], datetime] | None = None,
     _validate_token_on_create: bool = True,
 ) -> FastAPI:
@@ -50,19 +51,6 @@ def create_app(
         except Exception:  # pragma: no cover - driver loading differs by deployment
             database_initialization_failed = True
             session_factory = sessionmaker(expire_on_commit=False)
-    summarizer = DeterministicSummarizer()
-    if pipeline_service is None:
-        pipeline_service = PipelineService(
-            ingestion=IngestionService(
-                session_factory=session_factory,
-                source=FakeXSource({}),
-                max_pages=settings.x_max_pages_per_sync,
-                max_posts=settings.x_max_posts_per_sync,
-            ),
-            session_factory=session_factory,
-            summarizer=summarizer,
-            llm_max_items_per_run=settings.llm_max_items_per_run,
-        )
     x_oauth_client = XOAuthClient(
         session_factory=session_factory,
         client_id=settings.x_client_id,
@@ -71,6 +59,20 @@ def create_app(
         http_client=oauth_http_client,
         clock=oauth_clock,
     )
+    x_source = XApiSource(token_service=x_oauth_client, http_client=x_api_http_client)
+    summarizer = DeterministicSummarizer()
+    if pipeline_service is None:
+        pipeline_service = PipelineService(
+            ingestion=IngestionService(
+                session_factory=session_factory,
+                source=x_source,
+                max_pages=settings.x_max_pages_per_sync,
+                max_posts=settings.x_max_posts_per_sync,
+            ),
+            session_factory=session_factory,
+            summarizer=summarizer,
+            llm_max_items_per_run=settings.llm_max_items_per_run,
+        )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -78,7 +80,10 @@ def create_app(
         try:
             yield
         finally:
-            await x_oauth_client.aclose()
+            try:
+                await x_source.aclose()
+            finally:
+                await x_oauth_client.aclose()
 
     app = FastAPI(title="X Digest", lifespan=lifespan)
     app.state.settings = settings
@@ -86,6 +91,7 @@ def create_app(
     app.state.pipeline_service = pipeline_service
     app.state.summarizer = summarizer
     app.state.x_oauth_client = x_oauth_client
+    app.state.x_source = x_source
     install_error_handlers(app)
 
     @app.get("/health/live")
