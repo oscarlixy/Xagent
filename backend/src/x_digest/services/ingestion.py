@@ -33,6 +33,7 @@ _SAFE_OAUTH_ERROR_CODES = frozenset(
 )
 _GENERIC_FAILURE_CODE = "ingestion_failed"
 STALE_RUNNING_RUN_THRESHOLD = timedelta(hours=1)
+MAX_STALE_RUNS_PER_RECONCILIATION = 100
 
 
 @dataclass(frozen=True)
@@ -152,6 +153,8 @@ class IngestionService:
                     SyncRun.status == "running",
                     SyncRun.started_at <= cutoff,
                 )
+                .order_by(SyncRun.started_at, SyncRun.id)
+                .limit(MAX_STALE_RUNS_PER_RECONCILIATION)
             ).all()
             for sync_run in stale_runs:
                 finish_sync_run(session, sync_run=sync_run, status="failed")

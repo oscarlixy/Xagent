@@ -379,6 +379,59 @@ def test_cancelled_completion_marks_the_durable_run_failed_and_reraises() -> Non
         assert run.error_code == "ingestion_failed"
 
 
+def test_stale_run_reconciliation_selects_one_deterministic_oldest_batch() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(engine)
+    now = datetime.now()
+    stale_batch_limit = 100
+    with session_factory.begin() as session:
+        x_list = upsert_list(session, platform_list_id="123456789", name="AI news")
+        list_id = x_list.id
+        older_ids = [f"older-{index:03d}" for index in range(stale_batch_limit - 1)]
+        session.add_all(
+            SyncRun(
+                id=run_id,
+                list_id=list_id,
+                status="running",
+                started_at=now - timedelta(hours=3),
+            )
+            for run_id in older_ids
+        )
+        session.add_all(
+            SyncRun(
+                id=run_id,
+                list_id=list_id,
+                status="running",
+                started_at=now - timedelta(hours=2),
+            )
+            for run_id in ("boundary-c", "boundary-b", "boundary-a")
+        )
+        session.add(
+            SyncRun(id="recent", list_id=list_id, status="running", started_at=now)
+        )
+
+    asyncio.run(
+        IngestionService(
+            session_factory=session_factory, source=FakeXSource({None: SourcePage()})
+        ).sync_list(list_id)
+    )
+
+    initial_ids = [*older_ids, "boundary-a", "boundary-b", "boundary-c", "recent"]
+    with session_factory() as session:
+        runs = {
+            run.id: run
+            for run in session.scalars(select(SyncRun).where(SyncRun.id.in_(initial_ids)))
+        }
+
+    assert all(runs[run_id].status == "failed" for run_id in older_ids)
+    assert runs["boundary-a"].status == "failed"
+    assert runs["boundary-a"].error_code == "ingestion_failed"
+    assert runs["boundary-b"].status == "running"
+    assert runs["boundary-c"].status == "running"
+    assert runs["recent"].status == "running"
+
+
 def test_later_same_list_sync_reconciles_only_stale_running_runs_after_cleanup_failure() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
