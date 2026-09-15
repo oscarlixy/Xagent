@@ -49,11 +49,15 @@ def _run_snapshot(run: SyncRun | None) -> dict[str, Any] | None:
         if not isinstance(values, dict):
             continue
         counts = values.get("counts", {})
-        safe_counts = {
-            key: value
-            for key, value in counts.items()
-            if key in allowed_counts and isinstance(value, int) and not isinstance(value, bool)
-        } if isinstance(counts, dict) else {}
+        safe_counts = (
+            {
+                key: value
+                for key, value in counts.items()
+                if key in allowed_counts and isinstance(value, int) and not isinstance(value, bool)
+            }
+            if isinstance(counts, dict)
+            else {}
+        )
         duration = values.get("duration_ms", 0)
         error_code = values.get("error_code")
         safe_stages[name] = {

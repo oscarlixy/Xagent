@@ -200,14 +200,18 @@ class PipelineService:
     async def _summarize_pending_posts(self, list_id: str) -> StageResult:
         started = time.monotonic()
         with self._session_factory() as session:
-            threads = session.scalars(
-                select(Thread)
-                .join(ThreadPost, ThreadPost.thread_id == Thread.id)
-                .join(Post, Post.id == ThreadPost.post_id)
-                .join(PostListMembership, PostListMembership.post_id == Post.id)
-                .where(PostListMembership.list_id == list_id)
-                .order_by(Thread.created_at, Thread.id)
-            ).unique().all()
+            threads = (
+                session.scalars(
+                    select(Thread)
+                    .join(ThreadPost, ThreadPost.thread_id == Thread.id)
+                    .join(Post, Post.id == ThreadPost.post_id)
+                    .join(PostListMembership, PostListMembership.post_id == Post.id)
+                    .where(PostListMembership.list_id == list_id)
+                    .order_by(Thread.created_at, Thread.id)
+                )
+                .unique()
+                .all()
+            )
             pending = []
             for thread in threads:
                 posts = session.scalars(
@@ -250,9 +254,7 @@ class PipelineService:
                 last_error = "summary_processing_failed"
         return StageResult(counts=counts, duration_ms=_elapsed_ms(started), last_error=last_error)
 
-    def _finish_run(
-        self, run_id: str, status: str, stages: dict[str, StageResult]
-    ) -> None:
+    def _finish_run(self, run_id: str, status: str, stages: dict[str, StageResult]) -> None:
         with self._session_factory.begin() as session:
             sync_run = session.get(SyncRun, run_id)
             if sync_run is None:  # pragma: no cover - ingestion creates the run
@@ -284,11 +286,7 @@ class PipelineService:
                     "duration_ms": sum(stage.duration_ms for stage in result.stages.values()),
                     "counts": {name: stage.counts for name, stage in result.stages.items()},
                     "error_code": next(
-                        (
-                            stage.last_error
-                            for stage in result.stages.values()
-                            if stage.last_error
-                        ),
+                        (stage.last_error for stage in result.stages.values() if stage.last_error),
                         None,
                     ),
                 }

@@ -187,7 +187,8 @@ class IngestionService:
 
     @staticmethod
     def _store_post(
-        session: Session, x_list: XList, raw_post: RawPost, result: "_MutableSyncResult") -> None:
+        session: Session, x_list: XList, raw_post: RawPost, result: "_MutableSyncResult"
+    ) -> None:
         post, created = upsert_post(
             session,
             PostInput(
