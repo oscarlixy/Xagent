@@ -16,8 +16,6 @@ services:
 
   migrate:
     image: x-digest
-    build:
-      context: ./backend
     command: ["alembic", "upgrade", "head"]
     depends_on:
       postgres:
@@ -76,8 +74,6 @@ services:
 
   scheduler:
     image: x-digest
-    build:
-      context: ./backend
     command: ["python", "-m", "x_digest.scheduler"]
     env_file:
       - path: ./backend/.env
