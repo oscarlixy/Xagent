@@ -85,6 +85,51 @@ def test_store_overwrites_the_single_credential_for_a_provider(session: Session)
     )
 
 
+def test_store_preserves_existing_refresh_token_when_refresh_payload_omits_rotation(
+    session: Session,
+) -> None:
+    vault = TokenVault(session=session, encryption_key=FERNET_KEY)
+    vault.store(provider="x", token_payload=token_payload(), now=NOW)
+
+    vault.store(
+        provider="x",
+        token_payload={
+            "access_token": "test-access-beta",
+            "expires_in": 3600,
+            "scope": "tweet.read users.read list.read offline.access",
+        },
+        now=NOW + timedelta(minutes=5),
+        preserve_refresh_token_if_missing=True,
+    )
+
+    assert vault.load(provider="x") == OAuthTokenSet(
+        access_token="test-access-beta",
+        refresh_token="test-refresh-alpha",
+        access_expires_at=NOW + timedelta(minutes=65),
+        scope="tweet.read users.read list.read offline.access",
+    )
+
+
+def test_first_store_requires_refresh_token_even_when_preservation_is_requested(
+    session: Session,
+) -> None:
+    vault = TokenVault(session=session, encryption_key=FERNET_KEY)
+
+    with pytest.raises(ValueError):
+        vault.store(
+            provider="x",
+            token_payload={
+                "access_token": "test-access-alpha",
+                "expires_in": 3600,
+                "scope": "tweet.read users.read list.read offline.access",
+            },
+            now=NOW,
+            preserve_refresh_token_if_missing=True,
+        )
+
+    assert vault.load(provider="x") is None
+
+
 def test_expiry_uses_utc_and_refreshes_at_the_sixty_second_margin(session: Session) -> None:
     vault = TokenVault(session=session, encryption_key=FERNET_KEY)
     vault.store(provider="x", token_payload=token_payload(), now=NOW)

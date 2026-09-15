@@ -5,7 +5,7 @@ import inspect
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -21,13 +21,16 @@ from x_digest.models import DigestItem, XList
 from x_digest.services.digests import build_digest
 from x_digest.services.ingestion import IngestionService
 from x_digest.services.oauth_client import XOAuthClient
-from x_digest.services.pipeline import PipelineService
+from x_digest.services.pipeline import PipelineResult, PipelineService
 from x_digest.services.summarization import DeterministicSummarizer
 from x_digest.sources.x_api import XApiSource
 
 MISFIRE_GRACE_SECONDS = 300
 RECONCILE_INTERVAL_MINUTES = 5
 logger = logging.getLogger(__name__)
+
+type HttpClientFactory = Callable[[], httpx.AsyncClient]
+type ProductionPipelineRunner = Callable[[str], Awaitable[PipelineResult]]
 
 
 @dataclass(frozen=True)
@@ -246,33 +249,58 @@ def build_production_pipeline(
     )
 
 
+def build_production_pipeline_runner(
+    settings: Settings,
+    session_factory: sessionmaker[Session],
+    *,
+    oauth_http_client_factory: HttpClientFactory | None = None,
+    x_api_http_client_factory: HttpClientFactory | None = None,
+) -> ProductionPipelineRunner:
+    """Build a runner whose provider clients belong to one scheduled invocation."""
+
+    oauth_factory = oauth_http_client_factory or _new_provider_http_client
+    api_factory = x_api_http_client_factory or _new_provider_http_client
+
+    async def run(list_id: str) -> PipelineResult:
+        oauth_http_client = oauth_factory()
+        try:
+            x_api_http_client = api_factory()
+            try:
+                pipeline, _oauth_client, _source = build_production_pipeline(
+                    settings,
+                    session_factory,
+                    oauth_http_client=oauth_http_client,
+                    x_api_http_client=x_api_http_client,
+                )
+                return await pipeline.run_list_pipeline(list_id)
+            finally:
+                await x_api_http_client.aclose()
+        finally:
+            await oauth_http_client.aclose()
+
+    return run
+
+
+def _new_provider_http_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(timeout=10.0)
+
+
 def main() -> None:
     """Run the scheduler as a dedicated foreground process."""
 
     settings = Settings()
     engine = create_engine(settings.database_url)
     session_factory = sessionmaker(engine, expire_on_commit=False)
-    pipeline, oauth_client, source = build_production_pipeline(settings, session_factory)
-    try:
-        build_scheduler(
-            settings,
-            PipelineSchedulerServices(
-                session_factory=session_factory,
-                pipeline_runner=pipeline.run_list_pipeline,
-                digest_runner=lambda cadence: run_offline_digest(
-                    session_factory, cadence, settings.app_timezone
-                ),
+    build_scheduler(
+        settings,
+        PipelineSchedulerServices(
+            session_factory=session_factory,
+            pipeline_runner=build_production_pipeline_runner(settings, session_factory),
+            digest_runner=lambda cadence: run_offline_digest(
+                session_factory, cadence, settings.app_timezone
             ),
-        ).start()
-    finally:
-        asyncio.run(_close_production_clients(source, oauth_client))
-
-
-async def _close_production_clients(source: XApiSource, oauth_client: XOAuthClient) -> None:
-    try:
-        await source.aclose()
-    finally:
-        await oauth_client.aclose()
+        ),
+    ).start()
 
 
 if __name__ == "__main__":  # pragma: no cover

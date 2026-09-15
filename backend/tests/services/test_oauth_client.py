@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from x_digest.models import Base
+from x_digest.services import oauth_client as oauth_client_module
 from x_digest.services.oauth_client import OAuthClientError, XOAuthClient
 from x_digest.services.oauth_tokens import OAuthTokenSet, TokenVault
 
@@ -172,6 +173,67 @@ def test_access_token_refreshes_once_at_the_margin(
     }
 
 
+def test_access_token_accepts_refresh_response_without_rotated_refresh_token(
+    session_factory: sessionmaker[Session],
+) -> None:
+    _seed(session_factory)
+    service, http_client = _client(
+        session_factory,
+        lambda _request: httpx.Response(
+            200,
+            json={
+                "access_token": "test-access-beta",
+                "expires_in": 3600,
+                "scope": "tweet.read users.read list.read offline.access",
+            },
+        ),
+        now=NOW + timedelta(minutes=59),
+    )
+    try:
+        token = asyncio.run(service.access_token())
+    finally:
+        asyncio.run(http_client.aclose())
+
+    assert token == "test-access-beta"
+    with session_factory() as session:
+        assert TokenVault(session=session, encryption_key=FERNET_KEY).load(
+            provider="x"
+        ) == OAuthTokenSet(
+            access_token="test-access-beta",
+            refresh_token="test-refresh-alpha",
+            access_expires_at=NOW + timedelta(minutes=119),
+            scope="tweet.read users.read list.read offline.access",
+        )
+
+
+def test_exchange_code_rejects_success_response_without_refresh_token(
+    session_factory: sessionmaker[Session],
+) -> None:
+    service, http_client = _client(
+        session_factory,
+        lambda _request: httpx.Response(
+            200,
+            json={
+                "access_token": "test-access-alpha",
+                "expires_in": 3600,
+                "scope": "tweet.read users.read list.read offline.access",
+            },
+        ),
+    )
+    try:
+        with pytest.raises(OAuthClientError) as raised:
+            asyncio.run(
+                service.exchange_code(code="test-code-secret", verifier="test-verifier-secret")
+            )
+    finally:
+        asyncio.run(http_client.aclose())
+
+    assert raised.value.status_code == 502
+    assert raised.value.code == "oauth_token_invalid"
+    with session_factory() as session:
+        assert TokenVault(session=session, encryption_key=FERNET_KEY).load(provider="x") is None
+
+
 def test_concurrent_client_instances_share_one_process_refresh_lock(tmp_path) -> None:
     engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'oauth.sqlite3'}")
     Base.metadata.create_all(engine)
@@ -238,6 +300,24 @@ async def _concurrent_tokens(service: XOAuthClient) -> tuple[str, str]:
 async def _tokens_from_distinct_clients(clients: list[XOAuthClient]) -> tuple[str, str]:
     first, second = await asyncio.gather(clients[0].access_token(), clients[1].access_token())
     return first, second
+
+
+def test_process_lock_cancellation_does_not_leak_a_late_acquisition() -> None:
+    asyncio.run(_cancel_process_lock_waiter())
+
+
+async def _cancel_process_lock_waiter() -> None:
+    lock = oauth_client_module._ProcessAsyncLock()
+    await lock.acquire()
+    waiter = asyncio.create_task(lock.acquire())
+    await asyncio.sleep(0.02)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    lock.release()
+    await asyncio.wait_for(lock.acquire(), timeout=0.2)
+    lock.release()
 
 
 async def _exchange_while_refresh_is_in_flight(

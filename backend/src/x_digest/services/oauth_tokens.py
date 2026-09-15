@@ -37,10 +37,16 @@ class TokenVault:
         provider: str,
         token_payload: Mapping[str, object],
         now: datetime,
+        preserve_refresh_token_if_missing: bool = False,
     ) -> None:
-        access_token, refresh_token, expires_in, scope = _validated_payload(token_payload)
         now_utc = _require_aware_utc(now)
         credential = self._session.get(OAuthCredential, provider)
+        access_token, refresh_token, expires_in, scope = _validated_payload(
+            token_payload,
+            allow_missing_refresh_token=(
+                preserve_refresh_token_if_missing and credential is not None
+            ),
+        )
         if credential is None:
             credential = OAuthCredential(
                 provider=provider,
@@ -54,7 +60,8 @@ class TokenVault:
             self._session.add(credential)
 
         credential.encrypted_access_token = self._fernet.encrypt(access_token.encode())
-        credential.encrypted_refresh_token = self._fernet.encrypt(refresh_token.encode())
+        if refresh_token is not None:
+            credential.encrypted_refresh_token = self._fernet.encrypt(refresh_token.encode())
         credential.access_expires_at = now_utc + timedelta(seconds=expires_in)
         credential.scope = scope
         credential.updated_at = now_utc
@@ -84,22 +91,30 @@ class TokenVault:
         return _persisted_utc(credential.access_expires_at) <= now_utc + REFRESH_MARGIN
 
 
-def _validated_payload(payload: Mapping[str, object]) -> tuple[str, str, int, str]:
+def _validated_payload(
+    payload: Mapping[str, object], *, allow_missing_refresh_token: bool = False
+) -> tuple[str, str | None, int, str]:
     access_token = payload.get("access_token")
-    refresh_token = payload.get("refresh_token")
     expires_in = payload.get("expires_in")
     scope = payload.get("scope", "")
     if (
         not isinstance(access_token, str)
         or not access_token
-        or not isinstance(refresh_token, str)
-        or not refresh_token
         or isinstance(expires_in, bool)
         or not isinstance(expires_in, int)
         or expires_in <= 0
         or not isinstance(scope, str)
     ):
         raise ValueError("Invalid OAuth token payload")
+    if "refresh_token" not in payload:
+        if not allow_missing_refresh_token:
+            raise ValueError("Invalid OAuth token payload")
+        refresh_token: str | None = None
+    else:
+        refresh_token_value = payload["refresh_token"]
+        if not isinstance(refresh_token_value, str) or not refresh_token_value:
+            raise ValueError("Invalid OAuth token payload")
+        refresh_token = refresh_token_value
     return access_token, refresh_token, expires_in, scope
 
 

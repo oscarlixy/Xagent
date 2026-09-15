@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
+from types import TracebackType
 
 import httpx
 from pydantic import SecretStr
@@ -12,8 +14,36 @@ from x_digest.services.oauth_tokens import OAuthTokenSet, TokenVault
 
 X_PROVIDER = "x"
 DEFAULT_TOKEN_URL = "https://api.x.com/2/oauth2/token"
-_PROCESS_REFRESH_LOCK = asyncio.Lock()
-_PROCESS_CREDENTIAL_WRITE_LOCK = asyncio.Lock()
+_PROCESS_LOCK_RETRY_SECONDS = 0.01
+
+
+class _ProcessAsyncLock:
+    """Serialize coroutines across event loops without blocking their threads."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+
+    async def acquire(self) -> None:
+        while not self._lock.acquire(blocking=False):
+            await asyncio.sleep(_PROCESS_LOCK_RETRY_SECONDS)
+
+    def release(self) -> None:
+        self._lock.release()
+
+    async def __aenter__(self) -> None:
+        await self.acquire()
+
+    async def __aexit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        _exc: BaseException | None,
+        _traceback: TracebackType | None,
+    ) -> None:
+        self.release()
+
+
+_PROCESS_REFRESH_LOCK = _ProcessAsyncLock()
+_PROCESS_CREDENTIAL_WRITE_LOCK = _ProcessAsyncLock()
 
 type Clock = Callable[[], datetime]
 type OAuthCredentialView = OAuthTokenSet
@@ -113,7 +143,7 @@ class XOAuthClient:
                         raise _authorization_error()
                     if current != credential or not self._needs_refresh(vault):
                         return current.access_token
-                    self._store(vault, payload)
+                    self._store(vault, payload, preserve_refresh_token_if_missing=True)
                     refreshed = self._load(vault)
                     if refreshed is None:  # pragma: no cover - store guarantees a row
                         raise _invalid_token_error()
@@ -147,9 +177,20 @@ class XOAuthClient:
         except ValueError:
             raise _invalid_token_error() from None
 
-    def _store(self, vault: TokenVault, payload: Mapping[str, object]) -> None:
+    def _store(
+        self,
+        vault: TokenVault,
+        payload: Mapping[str, object],
+        *,
+        preserve_refresh_token_if_missing: bool = False,
+    ) -> None:
         try:
-            vault.store(provider=X_PROVIDER, token_payload=payload, now=self._clock())
+            vault.store(
+                provider=X_PROVIDER,
+                token_payload=payload,
+                now=self._clock(),
+                preserve_refresh_token_if_missing=preserve_refresh_token_if_missing,
+            )
         except ValueError:
             raise _invalid_token_error() from None
 
