@@ -53,6 +53,11 @@ class LeakyPipeline:
             run_id=f"run-for-{list_id}",
             status="partial",
             stages={
+                "ingestion": StageResult(
+                    counts={"rejected": 1},
+                    duration_ms=1,
+                    last_error="ingestion_partial",
+                ),
                 "links": StageResult(
                     counts={"failed": 1},
                     duration_ms=1,
@@ -595,6 +600,7 @@ def test_sync_job_omits_unknown_pipeline_error_text(api) -> None:
     response = client.post(f"/api/jobs/sync/{ids['list']}", headers=AUTH)
 
     assert response.status_code == 200
+    assert response.json()["stages"]["ingestion"]["last_error"] == "ingestion_partial"
     assert response.json()["stages"]["links"]["last_error"] is None
     assert (
         response.json()["stages"]["summary"]["last_error"]

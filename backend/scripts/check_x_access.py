@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from x_digest.config import Settings  # noqa: E402
 from x_digest.services.oauth_client import XOAuthClient  # noqa: E402
 from x_digest.sources.errors import XSourceError  # noqa: E402
+from x_digest.sources.types import SourcePage  # noqa: E402
 from x_digest.sources.x_api import XApiSource, is_valid_x_list_id  # noqa: E402
 
 
@@ -38,6 +39,14 @@ async def _close(source: XApiSource, client: XOAuthClient) -> None:
         await client.aclose()
 
 
+async def _probe(settings: Settings, list_id: str) -> SourcePage:
+    source, client = _build_source(settings)
+    try:
+        return await source.fetch_page(list_id=list_id, pagination_token=None, max_results=1)
+    finally:
+        await _close(source, client)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Probe private X List OAuth access")
     parser.add_argument("--list-id", required=True)
@@ -48,13 +57,8 @@ def main(argv: list[str] | None = None) -> int:
     if not is_valid_x_list_id(args.list_id):
         parser.error("--list-id must be a numeric X List ID")
 
-    source: XApiSource | None = None
-    client: XOAuthClient | None = None
     try:
-        source, client = _build_source(Settings())
-        page = asyncio.run(
-            source.fetch_page(list_id=args.list_id, pagination_token=None, max_results=1)
-        )
+        page = asyncio.run(_probe(Settings(), args.list_id))
     except XSourceError as error:
         print(_result_json(status="error", count=0, request_id=error.request_id))
         return 1
@@ -64,9 +68,6 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(_result_json(status="ok", count=len(page.posts), request_id=page.request_id))
         return 0
-    finally:
-        if source is not None and client is not None:
-            asyncio.run(_close(source, client))
 
 
 def _result_json(*, status: str, count: int, request_id: str | None) -> str:

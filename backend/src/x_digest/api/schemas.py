@@ -6,6 +6,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 _SAFE_PIPELINE_ERROR_CODES = {
+    "ingestion_partial",
     "link_failed",
     "link_processing_failed",
     "summary_processing_failed",

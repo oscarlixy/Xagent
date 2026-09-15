@@ -66,17 +66,19 @@ class PipelineService:
                     "posts_seen": sync.posts_seen,
                     "posts_created": sync.posts_created,
                     "duplicates": sync.duplicates,
+                    "rejected": sync.rejected,
                 },
                 duration_ms=_elapsed_ms(ingestion_started),
+                last_error="ingestion_partial" if sync.status == "partial" else None,
             )
         }
         stages["processing"] = self._record_processing(list_id)
         stages["links"] = self._record_pending_links(list_id)
         stages["summary"] = await self._summarize_pending_posts(list_id)
 
-        status: Literal["succeeded", "partial", "failed"] = (
-            "partial" if any(stage.last_error for stage in stages.values()) else "succeeded"
-        )
+        status: Literal["succeeded", "partial", "failed"] = sync.status
+        if status == "succeeded" and any(stage.last_error for stage in stages.values()):
+            status = "partial"
         self._finish_run(sync.run_id, status, stages)
         result = PipelineResult(run_id=sync.run_id, status=status, stages=stages)
         self._log_completion(list_id, result)

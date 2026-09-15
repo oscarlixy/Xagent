@@ -348,6 +348,104 @@ def test_preflight_outputs_only_safe_json_and_uses_one_result(
     assert probe_source.calls == [(LIST_ID, None, 1)]
 
 
+def test_preflight_constructs_fetches_and_closes_resources_in_one_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = Path(__file__).parents[2] / "scripts" / "check_x_access.py"
+    spec = importlib.util.spec_from_file_location("check_x_access_loop_bound", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    events: list[str] = []
+
+    class LoopBoundClient:
+        def __init__(self) -> None:
+            self.loop = asyncio.get_running_loop()
+            events.append("client.constructed")
+
+        async def aclose(self) -> None:
+            assert asyncio.get_running_loop() is self.loop
+            events.append("client.closed")
+
+    class LoopBoundSource:
+        def __init__(self, client: LoopBoundClient) -> None:
+            self.loop = asyncio.get_running_loop()
+            self.client = client
+            events.append("source.constructed")
+
+        async def fetch_page(
+            self, *, list_id: str, pagination_token: str | None, max_results: int
+        ) -> object:
+            assert asyncio.get_running_loop() is self.loop is self.client.loop
+            events.append("source.fetched")
+            from x_digest.sources.types import SourcePage
+
+            return SourcePage(request_id="request-loop", posts=())
+
+        async def aclose(self) -> None:
+            assert asyncio.get_running_loop() is self.loop
+            events.append("source.closed")
+
+    def build_source(_settings: object) -> tuple[LoopBoundSource, LoopBoundClient]:
+        client = LoopBoundClient()
+        return LoopBoundSource(client), client
+
+    monkeypatch.setattr(module, "_build_source", build_source)
+    output = io.StringIO()
+    with redirect_stdout(output):
+        code = module.main(["--list-id", LIST_ID, "--confirm"])
+
+    assert code == 0
+    assert output.getvalue() == '{"status":"ok","count":0,"request_id":"request-loop"}\n'
+    assert events == [
+        "client.constructed",
+        "source.constructed",
+        "source.fetched",
+        "source.closed",
+        "client.closed",
+    ]
+
+
+def test_preflight_cleanup_failure_returns_one_safe_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = Path(__file__).parents[2] / "scripts" / "check_x_access.py"
+    spec = importlib.util.spec_from_file_location("check_x_access_cleanup_failure", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class CleanupFailingSource:
+        async def fetch_page(
+            self, *, list_id: str, pagination_token: str | None, max_results: int
+        ) -> object:
+            from x_digest.sources.types import SourcePage
+
+            return SourcePage(request_id="request-success", posts=())
+
+        async def aclose(self) -> None:
+            raise RuntimeError("cleanup failed with " + SECRET)
+
+    class ProbeClient:
+        closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    client = ProbeClient()
+    monkeypatch.setattr(
+        module, "_build_source", lambda _settings: (CleanupFailingSource(), client)
+    )
+    output = io.StringIO()
+    with redirect_stdout(output):
+        code = module.main(["--list-id", LIST_ID, "--confirm"])
+
+    assert code == 1
+    assert output.getvalue() == '{"status":"error","count":0,"request_id":null}\n'
+    assert SECRET not in output.getvalue()
+    assert client.closed is True
+
+
 def test_preflight_rejects_invalid_list_id_before_constructing_oauth_source(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

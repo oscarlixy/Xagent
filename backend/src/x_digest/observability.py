@@ -14,7 +14,12 @@ _SAFE_STAGE_COUNTS = {
     "links": {"selected", "processed", "failed"},
     "summary": {"selected", "created", "failed"},
 }
-_SAFE_ERROR_CODES = {"link_failed", "link_processing_failed", "summary_processing_failed"}
+_SAFE_ERROR_CODES = {
+    "ingestion_partial",
+    "link_failed",
+    "link_processing_failed",
+    "summary_processing_failed",
+}
 
 
 def status_snapshot(session: Session) -> dict[str, Any]:
