@@ -1,10 +1,38 @@
 services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - x_digest_postgres_data:/var/lib/postgresql/data
+
+  migrate:
+    image: x-digest
+    build:
+      context: ./backend
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    restart: "no"
+
   frontend:
     image: x-digest-frontend
     build:
       context: ./frontend
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     environment:
       BACKEND_INTERNAL_URL: http://backend:8000
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
@@ -15,6 +43,12 @@ services:
       X_OAUTH_STATE_SECRET: ${X_OAUTH_STATE_SECRET}
     ports:
       - "127.0.0.1:${FRONTEND_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
 
   backend:
     image: x-digest
@@ -25,12 +59,21 @@ services:
       - path: ./backend/.env
         required: false
     environment:
-      DATABASE_URL: sqlite+pysqlite:////data/x_digest.db
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+      X_TOKEN_ENCRYPTION_KEY: ${X_TOKEN_ENCRYPTION_KEY}
     expose:
       - "8000"
-    volumes:
-      - x_digest_data:/data
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready').close()"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
   scheduler:
     image: x-digest
     build:
@@ -40,9 +83,12 @@ services:
       - path: ./backend/.env
         required: false
     environment:
-      DATABASE_URL: sqlite+pysqlite:////data/x_digest.db
-    volumes:
-      - x_digest_data:/data
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      X_TOKEN_ENCRYPTION_KEY: ${X_TOKEN_ENCRYPTION_KEY}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
 
 volumes:
-  x_digest_data:
+  x_digest_postgres_data:
