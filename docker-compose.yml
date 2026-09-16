@@ -59,6 +59,8 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:?Set POSTGRES_USER in .env}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:?Set POSTGRES_DB in .env}
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?Set INTERNAL_API_TOKEN in .env}
+      X_CLIENT_ID: ${X_CLIENT_ID:?Set X_CLIENT_ID in .env}
+      X_OAUTH_REDIRECT_URI: ${X_OAUTH_REDIRECT_URI:?Set X_OAUTH_REDIRECT_URI in .env}
       X_TOKEN_ENCRYPTION_KEY: ${X_TOKEN_ENCRYPTION_KEY:?Set X_TOKEN_ENCRYPTION_KEY in .env}
     expose:
       - "8000"
@@ -80,6 +82,8 @@ services:
         required: false
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:?Set POSTGRES_USER in .env}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      X_CLIENT_ID: ${X_CLIENT_ID:?Set X_CLIENT_ID in .env}
+      X_OAUTH_REDIRECT_URI: ${X_OAUTH_REDIRECT_URI:?Set X_OAUTH_REDIRECT_URI in .env}
       X_TOKEN_ENCRYPTION_KEY: ${X_TOKEN_ENCRYPTION_KEY:?Set X_TOKEN_ENCRYPTION_KEY in .env}
     depends_on:
       migrate:

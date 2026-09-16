@@ -57,3 +57,17 @@ def test_backend_services_share_one_built_image() -> None:
         "migrate": "x-digest",
         "scheduler": "x-digest",
     }
+    expected_oauth_environment = {
+        "X_CLIENT_ID": "replace-with-your-x-oauth-client-id",
+        "X_OAUTH_REDIRECT_URI": "http://localhost:3000/api/x/callback",
+    }
+    assert {
+        name: {
+            key: services[name]["environment"][key]
+            for key in expected_oauth_environment
+        }
+        for name in ("backend", "scheduler")
+    } == {
+        "backend": expected_oauth_environment,
+        "scheduler": expected_oauth_environment,
+    }

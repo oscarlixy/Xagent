@@ -7,10 +7,13 @@ from sqlalchemy import create_engine, inspect
 from alembic import command
 
 
-def test_initial_migration_creates_core_tables(tmp_path: Path) -> None:
+def test_initial_migration_creates_core_tables(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     database_path = tmp_path / "x_digest.sqlite3"
     config = Config("alembic.ini")
     config.set_main_option("sqlalchemy.url", f"sqlite+pysqlite:///{database_path}")
+    monkeypatch.delenv("DATABASE_URL", raising=False)
 
     command.upgrade(config, "head")
 

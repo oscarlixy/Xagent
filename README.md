@@ -13,6 +13,8 @@ docker compose up --build -d --wait
 docker compose ps --all
 ```
 
+`POSTGRES_PASSWORD` is used both by PostgreSQL and in `DATABASE_URL`. Use only URL-safe (unreserved) characters: letters, digits, `-`, `.`, `_`, and `~`; do not URL-encode it.
+
 The `migrate` service should show `Exited (0)`. The long-running `postgres`, `backend`, `scheduler`, and `frontend` services should be healthy or running.
 
 Inspect startup and runtime logs with:
