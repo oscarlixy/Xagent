@@ -34,6 +34,38 @@ export type DigestItem = {
   snapshot: Record<string, unknown> | null;
 };
 
+export type DigestEventType = "news" | "research" | "product" | "analysis" | "opinion";
+
+export type DigestEventSourceSnapshot = {
+  id: string;
+  username: string;
+  text: string;
+  url: string;
+};
+
+export type DigestEventSnapshot = {
+  title: string;
+  what_happened: string;
+  why_it_matters: string;
+  event_type: DigestEventType;
+  importance: number;
+  source_ids: string[];
+  sources: DigestEventSourceSnapshot[];
+};
+
+export type DigestTopicIndex = {
+  name: string;
+  events: Array<DigestEventSnapshot & { item_id: string }>;
+};
+
+export type EventDigestContent = {
+  schema_version: "event-digest-v1";
+  title: string;
+  overview: string;
+  topics: DigestTopicIndex[];
+  excluded_source_ids: string[];
+};
+
 export type Digest = {
   id: string;
   window_key: string;
@@ -43,6 +75,18 @@ export type Digest = {
   status: string;
   created_at: string;
   items: DigestItem[];
+};
+
+export type SystemStatus = {
+  sync_health: {
+    enabled_list_count: number;
+    stale_list_count: number;
+    stale: boolean;
+    status: "running" | "succeeded" | "partial" | "failed" | null;
+    last_attempt_at: string | null;
+    last_completed_at: string | null;
+    last_error: string | null;
+  };
 };
 
 export type Summary = {
@@ -83,6 +127,7 @@ async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const listDigests = () => apiRequest<Digest[]>("/api/digests");
+export const getStatus = () => apiRequest<SystemStatus>("/api/status");
 export const getDigest = (id: string) => apiRequest<Digest>(`/api/digests/${encodeURIComponent(id)}`);
 export const listPosts = (query: string) => apiRequest<PostPage>(`/api/posts${query ? `?${query}` : ""}`);
 

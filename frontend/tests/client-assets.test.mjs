@@ -36,3 +36,14 @@ test("emitted client assets do not contain server credential sentinels", async (
 
   assert.deepEqual(leaks, [], `Server credentials leaked into: ${leaks.join(", ")}`);
 });
+
+test("digest rendering does not opt into unsafe HTML", async () => {
+  const files = [
+    path.join(process.cwd(), "src", "app", "digests", "[id]", "page.tsx"),
+    path.join(process.cwd(), "src", "components", "DigestEventCard.tsx"),
+  ];
+  for (const file of files) {
+    const source = await readFile(file, "utf8");
+    assert.equal(source.includes("dangerouslySetInnerHTML"), false, file);
+  }
+});

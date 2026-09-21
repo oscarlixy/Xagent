@@ -91,6 +91,28 @@ DIGEST_TWO = {
     ],
 }
 
+STATUS = {
+    "latest_run": {
+        "id": "sync-run-1",
+        "list_id": "list-1",
+        "status": "partial",
+        "started_at": "2026-09-17T10:00:00Z",
+        "finished_at": "2026-09-17T11:00:00Z",
+        "stages": {},
+    },
+    "latest_summary": None,
+    "deliveries": {},
+    "sync_health": {
+        "enabled_list_count": 1,
+        "stale_list_count": 1,
+        "stale": True,
+        "status": "partial",
+        "last_attempt_at": "2026-09-17T11:00:00Z",
+        "last_completed_at": "2026-09-17T11:00:00Z",
+        "last_error": "summary_processing_failed",
+    },
+}
+
 UNSAFE_DIGEST = {
     **DIGEST,
     "id": "digest-unsafe",
@@ -106,6 +128,95 @@ UNSAFE_DIGEST = {
             },
         }
     ],
+}
+
+EVENT_ITEMS = [
+    {
+        "id": "event-agent",
+        "source_type": "event",
+        "source_id": "event-source-agent",
+        "topic": "Agent 与模型",
+        "position": 0,
+        "snapshot": {
+            "title": "长时间 Agent 任务存在语言质量漂移",
+            "what_happened": "Alice 与 Bob 分别报告长任务后段的输出质量下降。",
+            "why_it_matters": "这会影响自动化工作流的可靠性与验收方式。",
+            "event_type": "analysis",
+            "importance": 5,
+            "source_ids": ["post-1", "post-2"],
+            "sources": [],
+        },
+    },
+    {
+        "id": "event-opinion",
+        "source_type": "event",
+        "source_id": "event-source-opinion",
+        "topic": "Agent 与模型",
+        "position": 1,
+        "snapshot": {
+            "title": "评测应覆盖长任务尾段",
+            "what_happened": "Carol 认为现有短基准无法反映持续执行表现。",
+            "why_it_matters": "观点给出了可执行的评测改进方向。",
+            "event_type": "opinion",
+            "importance": 3,
+            "source_ids": ["post-3"],
+            "sources": [],
+        },
+    },
+    {
+        "id": "event-tool",
+        "source_type": "event",
+        "source_id": "event-source-tool",
+        "topic": "开发工具",
+        "position": 2,
+        "snapshot": {
+            "title": "新的追踪工具开放测试",
+            "what_happened": "Dave 发布了用于追踪 Agent 步骤的新工具。",
+            "why_it_matters": "开发者可以更快定位失败步骤。",
+            "event_type": "product",
+            "importance": 4,
+            "source_ids": ["post-4"],
+            "sources": [],
+        },
+    },
+]
+
+EVENT_DIGEST = {
+    **DIGEST,
+    "id": "digest-events",
+    "rendered_content": {
+        "schema_version": "event-digest-v1",
+        "title": "事件化 AI 摘要",
+        "overview": "本时段主要关注 Agent 稳定性与开发工具。",
+        "topics": [
+            {
+                "name": "Agent 与模型",
+                "events": [
+                    {**EVENT_ITEMS[0]["snapshot"], "item_id": "event-agent"},
+                    {**EVENT_ITEMS[1]["snapshot"], "item_id": "event-opinion"},
+                ],
+            },
+            {
+                "name": "开发工具",
+                "events": [{**EVENT_ITEMS[2]["snapshot"], "item_id": "event-tool"}],
+            },
+        ],
+        "excluded_source_ids": ["post-promo"],
+    },
+    "items": EVENT_ITEMS,
+}
+
+EMPTY_EVENT_DIGEST = {
+    **EVENT_DIGEST,
+    "id": "digest-empty",
+    "rendered_content": {
+        "schema_version": "event-digest-v1",
+        "title": "空时段摘要",
+        "overview": "该时间段没有可摘要的有效动态。",
+        "topics": [],
+        "excluded_source_ids": [],
+    },
+    "items": [],
 }
 
 
@@ -147,6 +258,12 @@ def list_digests(response: Response, authorization: str | None = Header(default=
     return [DIGEST]
 
 
+@app.get("/api/status")
+def get_status(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_token(authorization)
+    return STATUS
+
+
 @app.get("/api/digests/{digest_id}")
 def get_digest(digest_id: str, authorization: str | None = Header(default=None)) -> dict:
     require_token(authorization)
@@ -156,6 +273,10 @@ def get_digest(digest_id: str, authorization: str | None = Header(default=None))
         return DIGEST_TWO
     if digest_id == "digest-unsafe":
         return UNSAFE_DIGEST
+    if digest_id == "digest-events":
+        return EVENT_DIGEST
+    if digest_id == "digest-empty":
+        return EMPTY_EVENT_DIGEST
     return DIGEST
 
 
@@ -215,6 +336,8 @@ async def list_posts(
                     source_url="https://twitter.com/bob/status/19002",
                     text="A newly sourced post for digest version two.",
                 ),
+                post("post-3", "carol", text="Long-horizon evaluation needs tail checks."),
+                post("post-4", "dave", text="A new agent tracing tool is in beta."),
             ],
             "next_cursor": None,
         }

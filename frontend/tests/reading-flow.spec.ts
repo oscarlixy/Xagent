@@ -1,19 +1,8 @@
-import { expect, test, type Browser } from "@playwright/test";
+import { expect, test } from "@playwright/test";
 
 const oauthStateSecret = "test-x-oauth-state-secret-32-bytes-minimum";
 const oauthClientId = "test-x-client-id-must-stay-server-side";
 const oauthRedirectUri = "http://127.0.0.1:3100/api/x/callback";
-
-const operatorHeaders = {
-  Authorization: `Basic ${Buffer.from("reader:correct-horse-battery-staple").toString("base64")}`,
-};
-
-async function authenticatedPage(browser: Browser) {
-  const context = await browser.newContext({
-    httpCredentials: { username: "reader", password: "correct-horse-battery-staple" },
-  });
-  return { context, page: await context.newPage() };
-}
 
 function base64url(value: Uint8Array | string): string {
   const bytes = typeof value === "string" ? Buffer.from(value) : Buffer.from(value);
@@ -72,28 +61,17 @@ function expectClearedOAuthCookie(response: {
   expect(header?.toLowerCase()).toContain("path=/api/x");
 }
 
-test("requires operator Basic Auth for the reading interface", async ({ request }) => {
+test("allows anonymous access to the reading interface", async ({ request }) => {
   const response = await request.get("/");
 
-  expect(response.status()).toBe(401);
-  expect(response.headers()["www-authenticate"]).toBe('Basic realm="X Digest"');
-});
-
-test("rejects incorrect operator Basic Auth credentials", async ({ browser }) => {
-  const context = await browser.newContext({
-    httpCredentials: { username: "reader", password: "incorrect-password" },
-  });
-  const response = await context.request.get("/");
-
-  expect(response.status()).toBe(401);
-  expect(response.headers()["www-authenticate"]).toBe('Basic realm="X Digest"');
-  await context.close();
+  expect(response.status()).toBe(200);
+  expect(response.headers()["www-authenticate"]).toBeUndefined();
 });
 
 test("proxies API requests with server credentials and preserves the backend request ID", async ({
   request,
 }) => {
-  const response = await request.get("/api/digests", { headers: operatorHeaders });
+  const response = await request.get("/api/digests");
 
   expect(response.status()).toBe(200);
   expect((await response.json())[0].id).toBe("digest-1");
@@ -103,7 +81,6 @@ test("proxies API requests with server credentials and preserves the backend req
 test("forwards only allowlisted BFF request and response headers", async ({ request }) => {
   const response = await request.post("/api/inspect?topic=ai", {
     headers: {
-      ...operatorHeaders,
       Accept: "application/vnd.x-digest+json",
       Cookie: "operator_session=must-not-pass",
       "Idempotency-Key": "summary-request-1",
@@ -130,7 +107,7 @@ test("forwards only allowlisted BFF request and response headers", async ({ requ
 });
 
 test("rejects methods outside the BFF allowlist", async ({ request }) => {
-  const response = await request.put("/api/inspect", { headers: operatorHeaders });
+  const response = await request.put("/api/inspect");
   expect(response.status()).toBe(405);
 });
 
@@ -140,21 +117,8 @@ test("leaves the health endpoint public", async ({ request }) => {
   expect(await response.json()).toEqual({ status: "ok" });
 });
 
-test("does not exempt paths below the health endpoint from authentication", async ({ request }) => {
-  const response = await request.get("/health/private");
-  expect(response.status()).toBe(401);
-});
-
-test("does not treat static and image lookalike prefixes as public assets", async ({ request }) => {
-  for (const path of ["/_next/static-evil/file.js", "/_next/image-proxy/file.png"]) {
-    const response = await request.get(path);
-    expect(response.status(), path).toBe(401);
-  }
-});
-
 test("starts X authorization with S256 PKCE and a protected state cookie", async ({ request }) => {
   const response = await request.get("/api/x/authorize", {
-    headers: operatorHeaders,
     maxRedirects: 0,
   });
 
@@ -189,21 +153,10 @@ test("starts X authorization with S256 PKCE and a protected state cookie", async
   );
 });
 
-test("only the exact OAuth callback path bypasses operator Basic Auth", async ({ request }) => {
-  const callback = await request.get("/api/x/callback", { maxRedirects: 0 });
-  expect(callback.status()).not.toBe(401);
-
-  for (const path of ["/api/x/authorize", "/api/x/callback/", "/api/x/callback/child"]) {
-    const response = await request.get(path, { maxRedirects: 0 });
-    expect(response.status(), path).toBe(401);
-  }
-});
-
 test("rejects missing, tampered, and expired OAuth state without leaking inputs", async ({
   request,
 }) => {
   const authorization = await request.get("/api/x/authorize", {
-    headers: operatorHeaders,
     maxRedirects: 0,
   });
   const validCookie = oauthCookie(authorization);
@@ -261,7 +214,6 @@ test("turns an X denial into the fixed denied redirect and clears state", async 
 
 test("forwards only the callback code and verifier with server credentials", async ({ request }) => {
   const authorization = await request.get("/api/x/authorize", {
-    headers: operatorHeaders,
     maxRedirects: 0,
   });
   const cookie = oauthCookie(authorization);
@@ -271,7 +223,6 @@ test("forwards only the callback code and verifier with server credentials", asy
     `/api/x/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(payload.state)}`,
     {
       headers: {
-        ...operatorHeaders,
         Cookie: cookie,
         "X-Untrusted": "callback-header-must-not-pass",
       },
@@ -320,7 +271,6 @@ test("redacts callback inputs when the backend exchange fails", async ({ request
 test("returns safe 503 responses for missing or invalid OAuth configuration", async ({ request }) => {
   for (const port of [3101, 3102]) {
     const authorize = await request.get(`http://127.0.0.1:${port}/api/x/authorize`, {
-      headers: operatorHeaders,
       maxRedirects: 0,
     });
     expect(authorize.status(), `authorize:${port}`).toBe(503);
@@ -341,8 +291,7 @@ test("returns safe 503 responses for missing or invalid OAuth configuration", as
   }
 });
 
-test("shows digest list and a safe detail view with original source links", async ({ browser }) => {
-  const { context, page } = await authenticatedPage(browser);
+test("shows digest list and a safe detail view with original source links", async ({ page }) => {
   await page.goto("/");
 
   await expect(page.getByRole("heading", { name: "X List Digest" })).toBeVisible();
@@ -354,29 +303,77 @@ test("shows digest list and a safe detail view with original source links", asyn
     "href",
     "https://x.com/alice/status/19001",
   );
-  await context.close();
 });
 
-test("does not make an untrusted post source URL clickable", async ({ browser }) => {
-  const { context, page } = await authenticatedPage(browser);
+test("renders event digests as ordered topics with source-aligned cards", async ({ page }) => {
+  await page.goto("/digests/digest-events");
+
+  await expect(page.getByText("本时段主要关注 Agent 稳定性与开发工具。", { exact: true })).toHaveCount(1);
+  const topicHeadings = page.locator(".digest-topic > h2");
+  await expect(topicHeadings).toHaveText(["Agent 与模型", "开发工具"]);
+  await expect(page.getByRole("heading", { name: "长时间 Agent 任务存在语言质量漂移" })).toBeVisible();
+  await expect(page.getByText("发生了什么", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("为什么值得关注", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("观点", { exact: true })).toBeVisible();
+  await expect(page.getByText("播客预告，无新增信息")).toHaveCount(0);
+  await expect(page.locator("[data-event-id='event-agent'] .source-link")).toHaveCount(2);
+  await expect(page.locator("[data-event-id='event-agent'] .source-link").nth(0)).toContainText("@alice");
+  await expect(page.locator("[data-event-id='event-agent'] .source-link").nth(1)).toContainText("@bob");
+  await expect(page.locator("[data-event-id='event-opinion'] .source-link")).toHaveCount(1);
+});
+
+test("renders an empty event digest without event cards", async ({ page }) => {
+  await page.goto("/digests/digest-empty");
+
+  await expect(page.getByText("该时间段没有可摘要的有效动态。")).toBeVisible();
+  await expect(page.locator(".digest-event")).toHaveCount(0);
+});
+
+test("keeps a loaded digest trustworthy when live source enrichment fails", async ({ page }) => {
+  await page.route("**/api/posts?limit=100", async (route) => {
+    await route.fulfill({ status: 503, contentType: "application/json", body: '{"detail":"posts unavailable"}' });
+  });
+
+  await page.goto("/digests/digest-1");
+
+  await expect(page.getByRole("heading", { name: "Daily AI Brief" })).toBeVisible();
+  await expect(page.getByText("A concise, traceable summary.")).toBeVisible();
+  await expect(page.locator(".error-message[role=alert]")).toHaveCount(0);
+  await expect(page.getByRole("status")).toContainText("Digest loaded successfully");
+  await expect(page.getByRole("status")).toContainText("saved digest snapshot below is unchanged");
+});
+
+test("shows a digest load error only when the digest request itself fails", async ({ page }) => {
+  await page.goto("/digests/error");
+
+  await expect(page.locator(".error-message[role=alert]")).toHaveText("Could not load this digest.");
+  await expect(page.getByRole("heading")).toHaveCount(0);
+});
+
+test("warns when data is stale and shows the latest sync failure", async ({ page }) => {
+  await page.goto("/");
+
+  await expect(page.getByRole("alert", { name: "Data freshness" })).toContainText("Data is stale");
+  await expect(page.getByText("Last sync")).toBeVisible();
+  await expect(page.locator("time[datetime='2026-09-17T11:00:00Z']")).toBeVisible();
+  await expect(page.getByText(/Summary processing failed/i)).toBeVisible();
+});
+
+test("does not make an untrusted post source URL clickable", async ({ page }) => {
   await page.goto("/posts?author=unsafe-link");
 
   await expect(page.getByText("Original launch notes with practical deployment details.")).toBeVisible();
   await expect(page.getByRole("link", { name: "View original on X" })).toHaveCount(0);
-  await context.close();
 });
 
-test("does not make an untrusted digest snapshot URL clickable", async ({ browser }) => {
-  const { context, page } = await authenticatedPage(browser);
+test("does not make an untrusted digest snapshot URL clickable", async ({ page }) => {
   await page.goto("/digests/digest-unsafe");
 
   await expect(page.getByRole("heading", { name: "Unsafe Digest" })).toBeVisible();
   await expect(page.getByRole("link", { name: "View original on X" })).toHaveCount(0);
-  await context.close();
 });
 
-test("keeps every post filter in the URL and shows the matching stream", async ({ browser }) => {
-  const { context, page } = await authenticatedPage(browser);
+test("keeps every post filter in the URL and shows the matching stream", async ({ page }) => {
   await page.goto("/posts");
 
   await page.getByLabel("List ID").fill("list-1");
@@ -395,20 +392,16 @@ test("keeps every post filter in the URL and shows the matching stream", async (
   await expect(page).toHaveURL(/state=saved/);
   await expect(page.getByText("Original launch notes with practical deployment details.")).toBeVisible();
   await expect(page.getByRole("link", { name: "View original on X" })).toBeVisible();
-  await context.close();
 });
 
-test("includes the whole selected end date in the backend filter", async ({ browser }) => {
-  const { context, page } = await authenticatedPage(browser);
+test("includes the whole selected end date in the backend filter", async ({ page }) => {
   await page.goto("/posts?author=date-boundary&to=2026-09-11");
 
   await expect(page).toHaveURL(/to=2026-09-11/);
   await expect(page.getByText("A post from the final minute of the selected day.")).toBeVisible();
-  await context.close();
 });
 
-test("loads and appends the next post cursor page", async ({ browser }) => {
-  const { context, page } = await authenticatedPage(browser);
+test("loads and appends the next post cursor page", async ({ page }) => {
   await page.goto("/posts?author=pagination");
 
   await expect(page.getByText("First page post")).toBeVisible();
@@ -416,11 +409,9 @@ test("loads and appends the next post cursor page", async ({ browser }) => {
   await expect(page.getByText("First page post")).toBeVisible();
   await expect(page.getByText("Second page post")).toBeVisible();
   await expect(page.getByRole("button", { name: "Load more posts" })).toHaveCount(0);
-  await context.close();
 });
 
-test("updates post state optimistically and regenerates its summary", async ({ browser }) => {
-  const { context, page } = await authenticatedPage(browser);
+test("updates post state optimistically and regenerates its summary", async ({ page }) => {
   await page.goto("/posts");
   const read = page.getByRole("button", { name: "Mark as read" });
   const save = page.getByRole("button", { name: "Save post" });
@@ -434,22 +425,18 @@ test("updates post state optimistically and regenerates its summary", async ({ b
   await expect(ignore).toHaveAttribute("aria-pressed", "true");
   await page.getByRole("button", { name: "Regenerate summary" }).click();
   await expect(page.getByText("Regenerated summary for the complete source unit.")).toBeVisible();
-  await context.close();
 });
 
-test("rolls back an optimistic action and announces the failure", async ({ browser }) => {
-  const { context, page } = await authenticatedPage(browser);
+test("rolls back an optimistic action and announces the failure", async ({ page }) => {
   await page.goto("/posts?author=fail-actions");
   const save = page.getByRole("button", { name: "Save post" });
 
   await save.click();
   await expect(save).toHaveAttribute("aria-pressed", "false");
   await expect(page.locator(".error-message[role=alert]")).toContainText("Could not update this post");
-  await context.close();
 });
 
-test("regenerates a digest and shows the new immutable version", async ({ browser }) => {
-  const { context, page } = await authenticatedPage(browser);
+test("regenerates a digest and shows the new immutable version", async ({ page }) => {
   await page.goto("/digests/digest-1");
 
   await page.getByRole("button", { name: "Regenerate digest" }).click();
@@ -460,11 +447,9 @@ test("regenerates a digest and shows the new immutable version", async ({ browse
     "href",
     "https://twitter.com/bob/status/19002",
   );
-  await context.close();
 });
 
-test("shows loading, empty, and backend error states", async ({ browser }) => {
-  const { context, page } = await authenticatedPage(browser);
+test("shows loading, empty, and backend error states", async ({ page }) => {
   await page.goto("/posts?author=loading");
   await expect(page.getByText("Loading posts…")).toBeVisible();
   await expect(page.getByText("Original launch notes with practical deployment details.")).toBeVisible();
@@ -474,5 +459,4 @@ test("shows loading, empty, and backend error states", async ({ browser }) => {
 
   await page.goto("/posts?author=error");
   await expect(page.locator(".error-message[role=alert]")).toContainText("Could not load posts");
-  await context.close();
 });
