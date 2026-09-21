@@ -10,7 +10,8 @@ from x_digest.api.auth import require_internal_token
 from x_digest.api.errors import APIError
 from x_digest.api.schemas import DigestItemResponse, DigestResponse
 from x_digest.models import Digest
-from x_digest.services.digests import build_digest
+from x_digest.services.digest_synthesis import DigestSynthesizer
+from x_digest.services.digests import DigestWindow, generate_digest
 
 router = APIRouter(prefix="/api/digests", dependencies=[Depends(require_internal_token)])
 
@@ -21,8 +22,13 @@ def _session(request: Request) -> Iterator[Session]:
 
 
 class DigestService:
-    def __init__(self, session: Session) -> None:
+    def __init__(
+        self,
+        session: Session,
+        digest_synthesizer: DigestSynthesizer | None = None,
+    ) -> None:
         self._session = session
+        self._digest_synthesizer = digest_synthesizer
 
     def list(self) -> list[DigestResponse]:
         digests = self._session.scalars(
@@ -40,11 +46,27 @@ class DigestService:
             raise APIError(404, "digest_not_found", "Digest not found")
         return _response(digest)
 
-    def regenerate(self, digest_id: str) -> DigestResponse:
+    async def regenerate(self, digest_id: str) -> DigestResponse:
         existing = self._session.get(Digest, digest_id)
         if existing is None:
             raise APIError(404, "digest_not_found", "Digest not found")
-        digest, _ = build_digest(self._session, window_key=existing.window_key, regenerate=True)
+        if self._digest_synthesizer is None:
+            raise RuntimeError("digest_synthesizer_not_configured")
+        window = None
+        if existing.window_start_at is not None and existing.window_end_at is not None:
+            window = DigestWindow(
+                start=existing.window_start_at,
+                end=existing.window_end_at,
+                cadence="6h" if existing.window_key.endswith("/6h") else "daily",
+                timezone=existing.timezone,
+            )
+        digest, _ = await generate_digest(
+            self._session,
+            synthesizer=self._digest_synthesizer,
+            window=window,
+            window_key=None if window is not None else existing.window_key,
+            regenerate=True,
+        )
         self._session.commit()
         return self.get(digest.id)
 
@@ -87,5 +109,12 @@ def get_digest(digest_id: str, session: Session = Depends(_session)) -> DigestRe
     response_model=DigestResponse,
     status_code=status.HTTP_201_CREATED,
 )
-def regenerate_digest(digest_id: str, session: Session = Depends(_session)) -> DigestResponse:
-    return DigestService(session).regenerate(digest_id)
+async def regenerate_digest(
+    digest_id: str,
+    request: Request,
+    session: Session = Depends(_session),
+) -> DigestResponse:
+    return await DigestService(
+        session,
+        digest_synthesizer=request.app.state.digest_synthesizer,
+    ).regenerate(digest_id)

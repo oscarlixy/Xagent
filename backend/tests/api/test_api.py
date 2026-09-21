@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, event, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -24,6 +24,7 @@ from x_digest.models import (
     PostListMembership,
     PostState,
     Summary,
+    SyncRun,
     XList,
 )
 from x_digest.services.pipeline import PipelineResult, StageResult
@@ -79,6 +80,13 @@ def api() -> tuple[TestClient, sessionmaker[Session], dict[str, str]]:
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
+
+    @event.listens_for(engine, "connect")
+    def enable_foreign_keys(connection: object, _record: object) -> None:
+        cursor = connection.cursor()  # type: ignore[attr-defined]
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
     Base.metadata.create_all(engine)
     factory = sessionmaker(engine, expire_on_commit=False)
     now = datetime(2026, 9, 11, 12, tzinfo=UTC)
@@ -145,6 +153,7 @@ def api() -> tuple[TestClient, sessionmaker[Session], dict[str, str]]:
                     language="en",
                     source_ids=[tied_b.id],
                 ),
+                SyncRun(list_id=ai_list.id, status="succeeded"),
             ]
         )
         first_digest = Digest(window_key="2026-09-11/UTC/24h", version=1)
@@ -241,6 +250,9 @@ def test_list_crud_validates_input_and_missing_resources(api) -> None:
             select(PostListMembership).where(PostListMembership.list_id == ids["list"])
         ).all()
         assert memberships == []
+        assert session.scalars(
+            select(SyncRun).where(SyncRun.list_id == ids["list"])
+        ).all() == []
 
 
 def test_request_models_reject_type_coercion(api) -> None:
@@ -309,6 +321,33 @@ def test_posts_use_stable_cursor_pagination_and_include_source_url(api) -> None:
     invalid = client.get("/api/posts?cursor=not-a-cursor", headers=AUTH)
     assert invalid.status_code == 422
     assert invalid.json()["code"] == "invalid_cursor"
+
+
+def test_posts_deduplicate_without_database_distinct(api) -> None:
+    client, factory, _ids = api
+    statements: list[str] = []
+    engine = factory.kw["bind"]
+
+    def capture_statement(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", capture_statement)
+    try:
+        response = client.get("/api/posts", headers=AUTH)
+    finally:
+        event.remove(engine, "before_cursor_execute", capture_statement)
+
+    assert response.status_code == 200
+    post_queries = [statement for statement in statements if "FROM posts" in statement]
+    assert post_queries
+    assert all("SELECT DISTINCT" not in statement.upper() for statement in post_queries)
 
 
 def test_posts_apply_combined_list_topic_author_time_and_state_filters(api) -> None:
@@ -399,6 +438,7 @@ def test_digest_version_retrieval_and_regeneration(api) -> None:
     assert detail.json()["items"][0]["snapshot"]["summary"] == "Version two"
     assert regenerated.status_code == 201
     assert regenerated.json()["version"] == 3
+    assert regenerated.json()["rendered_content"]["schema_version"] == "event-digest-v1"
     missing = client.get("/api/digests/missing", headers=AUTH)
     assert missing.status_code == 404
     assert missing.json()["code"] == "digest_not_found"
@@ -561,7 +601,12 @@ def test_sync_job_returns_pipeline_result_and_status_is_safe(api) -> None:
     assert result.json()["run_id"] == f"run-for-{ids['list']}"
     assert result.json()["stages"]["ingestion"]["counts"] == {"posts_created": 0}
     assert status.status_code == 200
-    assert set(status.json()) == {"latest_run", "latest_summary", "deliveries"}
+    assert set(status.json()) == {
+        "latest_run",
+        "latest_summary",
+        "deliveries",
+        "sync_health",
+    }
     missing = client.post("/api/jobs/sync/missing", headers=AUTH)
     assert missing.status_code == 404
     assert missing.json()["code"] == "list_not_found"

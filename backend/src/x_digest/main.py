@@ -1,12 +1,13 @@
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import httpx
 from fastapi import FastAPI
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
+from x_digest.ai.providers import build_digest_synthesizer, build_summarizer
 from x_digest.api.auth import validate_internal_api_token
 from x_digest.api.digests import router as digests_router
 from x_digest.api.errors import DatabaseUnavailableError, install_error_handlers
@@ -18,9 +19,9 @@ from x_digest.api.status import router as status_router
 from x_digest.api.x_oauth import router as x_oauth_router
 from x_digest.config import Settings
 from x_digest.services.ingestion import IngestionService
+from x_digest.services.link_content import LinkContentFetcher
 from x_digest.services.oauth_client import XOAuthClient
 from x_digest.services.pipeline import PipelineService
-from x_digest.services.summarization import DeterministicSummarizer
 from x_digest.sources.x_api import XApiSource
 
 
@@ -54,13 +55,15 @@ def create_app(
     x_oauth_client = XOAuthClient(
         session_factory=session_factory,
         client_id=settings.x_client_id,
+        client_secret=settings.x_client_secret,
         redirect_uri=settings.x_oauth_redirect_uri,
         encryption_key=settings.x_token_encryption_key,
         http_client=oauth_http_client,
         clock=oauth_clock,
     )
     x_source = XApiSource(token_service=x_oauth_client, http_client=x_api_http_client)
-    summarizer = DeterministicSummarizer()
+    summarizer = build_summarizer(settings)
+    digest_synthesizer = build_digest_synthesizer(settings)
     if pipeline_service is None:
         pipeline_service = PipelineService(
             ingestion=IngestionService(
@@ -68,10 +71,15 @@ def create_app(
                 source=x_source,
                 max_pages=settings.x_max_pages_per_sync,
                 max_posts=settings.x_max_posts_per_sync,
+                overlap=timedelta(minutes=settings.x_ingestion_overlap_minutes),
             ),
             session_factory=session_factory,
             summarizer=summarizer,
             llm_max_items_per_run=settings.llm_max_items_per_run,
+            link_fetcher=LinkContentFetcher(),
+            link_max_items_per_run=settings.link_max_items_per_run,
+            link_max_attempts=settings.link_max_attempts,
+            link_retry_delay=timedelta(seconds=settings.link_retry_base_seconds),
         )
 
     @asynccontextmanager
@@ -90,6 +98,7 @@ def create_app(
     app.state.session_factory = session_factory
     app.state.pipeline_service = pipeline_service
     app.state.summarizer = summarizer
+    app.state.digest_synthesizer = digest_synthesizer
     app.state.x_oauth_client = x_oauth_client
     app.state.x_source = x_source
     install_error_handlers(app)

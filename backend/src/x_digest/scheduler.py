@@ -8,7 +8,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -16,16 +16,21 @@ from apscheduler.schedulers.blocking import BlockingScheduler  # type: ignore[im
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from x_digest.ai.providers import build_digest_synthesizer, build_summarizer
 from x_digest.config import Settings
 from x_digest.models import DigestItem, XList
-from x_digest.services.digests import build_digest
+from x_digest.notifications.base import Notifier
+from x_digest.notifications.email import SMTPNotifier
+from x_digest.notifications.telegram import TelegramNotifier
+from x_digest.services.digest_synthesis import DigestSynthesizer
+from x_digest.services.digests import generate_digest, window_for
 from x_digest.services.ingestion import IngestionService
+from x_digest.services.link_content import LinkContentFetcher
+from x_digest.services.notification_delivery import NotificationDeliveryService
 from x_digest.services.oauth_client import XOAuthClient
 from x_digest.services.pipeline import PipelineResult, PipelineService
-from x_digest.services.summarization import DeterministicSummarizer
 from x_digest.sources.x_api import XApiSource
 
-MISFIRE_GRACE_SECONDS = 300
 RECONCILE_INTERVAL_MINUTES = 5
 logger = logging.getLogger(__name__)
 
@@ -39,6 +44,7 @@ class PipelineSchedulerServices:
     pipeline_runner: Callable[[str], Any]
     digest_runner: Callable[[str], Any] | None = None
     notification_runner: Callable[[str], Any] | None = None
+    notification_retry_runner: Callable[[], Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -50,7 +56,7 @@ class DigestRunResult:
 def build_scheduler(settings: Settings, services: PipelineSchedulerServices) -> BlockingScheduler:
     timezone = ZoneInfo(settings.app_timezone)
     scheduler = BlockingScheduler(timezone=timezone)
-    reconcile_list_jobs(scheduler, services)
+    reconcile_list_jobs(scheduler, services, run_new_jobs_immediately=False)
     scheduler.add_job(
         reconcile_list_jobs,
         trigger="interval",
@@ -60,7 +66,8 @@ def build_scheduler(settings: Settings, services: PipelineSchedulerServices) -> 
         replace_existing=True,
         **_safe_job_options(),
     )
-    for cadence in _configured_cadences(settings.digest_cadence):
+    cadences = _configured_cadences(settings.digest_cadence)
+    for cadence in cadences:
         if cadence == "6h":
             trigger: Any = "interval"
             trigger_kwargs = {"hours": 6, "timezone": timezone}
@@ -76,10 +83,35 @@ def build_scheduler(settings: Settings, services: PipelineSchedulerServices) -> 
             **trigger_kwargs,
             **_safe_job_options(),
         )
+    enabled_list_ids = _enabled_list_ids(services)
+    scheduler.add_job(
+        _run_startup_recovery,
+        trigger="date",
+        run_date=datetime.now(timezone),
+        args=[services, enabled_list_ids, cadences],
+        id="startup-recovery",
+        replace_existing=True,
+        **_safe_job_options(),
+    )
+    if services.notification_retry_runner is not None:
+        scheduler.add_job(
+            _run_notification_retries,
+            trigger="interval",
+            minutes=1,
+            args=[services],
+            id="notification-retries",
+            replace_existing=True,
+            **_safe_job_options(),
+        )
     return scheduler
 
 
-def reconcile_list_jobs(scheduler: BlockingScheduler, services: PipelineSchedulerServices) -> None:
+def reconcile_list_jobs(
+    scheduler: BlockingScheduler,
+    services: PipelineSchedulerServices,
+    *,
+    run_new_jobs_immediately: bool = True,
+) -> None:
     with services.session_factory() as session:
         enabled_lists = session.scalars(select(XList).where(XList.enabled.is_(True))).all()
     enabled_ids = {x_list.id for x_list in enabled_lists}
@@ -98,6 +130,9 @@ def reconcile_list_jobs(scheduler: BlockingScheduler, services: PipelineSchedule
                 )
                 continue
             scheduler.remove_job(job_id)
+        options = _safe_job_options()
+        if run_new_jobs_immediately:
+            options["next_run_time"] = datetime.now(scheduler.timezone)
         scheduler.add_job(
             _run_pipeline,
             trigger="interval",
@@ -105,7 +140,16 @@ def reconcile_list_jobs(scheduler: BlockingScheduler, services: PipelineSchedule
             args=[services, x_list.id],
             id=job_id,
             replace_existing=True,
-            **_safe_job_options(),
+            **options,
+        )
+
+
+def _enabled_list_ids(services: PipelineSchedulerServices) -> tuple[str, ...]:
+    with services.session_factory() as session:
+        return tuple(
+            session.scalars(
+                select(XList.id).where(XList.enabled.is_(True)).order_by(XList.id)
+            ).all()
         )
 
 
@@ -132,7 +176,7 @@ def _safe_job_options() -> dict[str, Any]:
     return {
         "coalesce": True,
         "max_instances": 1,
-        "misfire_grace_time": MISFIRE_GRACE_SECONDS,
+        "misfire_grace_time": None,
     }
 
 
@@ -142,6 +186,28 @@ def _has_interval(job: Any, minutes: int) -> bool:
 
 def _run_pipeline(services: PipelineSchedulerServices, list_id: str) -> None:
     _run_maybe_async(services.pipeline_runner(list_id))
+
+
+def _run_startup_recovery(
+    services: PipelineSchedulerServices,
+    list_ids: tuple[str, ...],
+    cadences: tuple[str, ...],
+) -> None:
+    for list_id in list_ids:
+        try:
+            _run_pipeline(services, list_id)
+        except Exception:
+            logger.warning(
+                json.dumps(
+                    {
+                        "event": "pipeline.startup_recovery_failed",
+                        "list_id": list_id,
+                        "error_code": "pipeline_processing_failed",
+                    }
+                )
+            )
+    for cadence in cadences:
+        _run_digest(services, cadence)
 
 
 def _run_digest(services: PipelineSchedulerServices, cadence: str) -> None:
@@ -175,11 +241,17 @@ def _run_digest(services: PipelineSchedulerServices, cadence: str) -> None:
                 }
             )
         )
+        _run_notification(services, result.digest_id)
 
 
 def _run_notification(services: PipelineSchedulerServices, digest_id: str) -> None:
     if services.notification_runner is not None:
         _run_maybe_async(services.notification_runner(digest_id))
+
+
+def _run_notification_retries(services: PipelineSchedulerServices) -> None:
+    if services.notification_retry_runner is not None:
+        _run_maybe_async(services.notification_retry_runner())
 
 
 def _run_maybe_async(value: Any) -> Any:
@@ -192,11 +264,22 @@ async def _await(value: Any) -> Any:
     return await value
 
 
-def run_offline_digest(
-    session_factory: sessionmaker[Session], cadence: str, timezone: str
+async def run_offline_digest(
+    session_factory: sessionmaker[Session],
+    cadence: str,
+    timezone: str,
+    synthesizer: DigestSynthesizer,
 ) -> DigestRunResult:
+    if cadence not in ("6h", "daily"):
+        raise ValueError(f"Unsupported digest cadence: {cadence}")
+    typed_cadence = cast(Literal["6h", "daily"], cadence)
+    window = window_for(datetime.now(ZoneInfo(timezone)), typed_cadence, ZoneInfo(timezone))
     with session_factory.begin() as session:
-        digest, _ = build_digest(session, window_key=_digest_window_key(cadence, timezone))
+        digest, _ = await generate_digest(
+            session,
+            window=window,
+            synthesizer=synthesizer,
+        )
         item_count = session.scalar(
             select(func.count()).select_from(DigestItem).where(DigestItem.digest_id == digest.id)
         )
@@ -204,11 +287,10 @@ def run_offline_digest(
 
 
 def _digest_window_key(cadence: str, timezone: str) -> str:
-    now = datetime.now(ZoneInfo(timezone))
-    if cadence == "6h":
-        start_hour = now.hour - (now.hour % 6)
-        return f"{now:%Y-%m-%d}T{start_hour:02d}:00/{timezone}/6h"
-    return f"{now:%Y-%m-%d}/{timezone}/24h"
+    if cadence not in ("6h", "daily"):
+        raise ValueError(f"Unsupported digest cadence: {cadence}")
+    typed_cadence = cast(Literal["6h", "daily"], cadence)
+    return window_for(datetime.now(ZoneInfo(timezone)), typed_cadence, ZoneInfo(timezone)).key
 
 
 def _elapsed_ms(started: float) -> int:
@@ -227,6 +309,7 @@ def build_production_pipeline(
     oauth_client = XOAuthClient(
         session_factory=session_factory,
         client_id=settings.x_client_id,
+        client_secret=settings.x_client_secret,
         redirect_uri=settings.x_oauth_redirect_uri,
         encryption_key=settings.x_token_encryption_key,
         http_client=oauth_http_client,
@@ -239,10 +322,15 @@ def build_production_pipeline(
                 source=source,
                 max_pages=settings.x_max_pages_per_sync,
                 max_posts=settings.x_max_posts_per_sync,
+                overlap=timedelta(minutes=settings.x_ingestion_overlap_minutes),
             ),
             session_factory=session_factory,
-            summarizer=DeterministicSummarizer(),
+            summarizer=build_summarizer(settings),
             llm_max_items_per_run=settings.llm_max_items_per_run,
+            link_fetcher=LinkContentFetcher(),
+            link_max_items_per_run=settings.link_max_items_per_run,
+            link_max_attempts=settings.link_max_attempts,
+            link_retry_delay=timedelta(seconds=settings.link_retry_base_seconds),
         ),
         oauth_client,
         source,
@@ -285,19 +373,70 @@ def _new_provider_http_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(timeout=10.0)
 
 
+def build_notification_runner(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> tuple[Callable[[str], Awaitable[None]], Callable[[], Awaitable[None]]] | None:
+    notifiers: dict[str, Notifier] = {}
+    if settings.smtp_host and settings.smtp_from and settings.smtp_to:
+        notifiers["email"] = SMTPNotifier(
+            host=settings.smtp_host,
+            port=settings.smtp_port,
+            sender=settings.smtp_from,
+            recipient=settings.smtp_to,
+            username=settings.smtp_username,
+            password=(
+                settings.smtp_password.get_secret_value() if settings.smtp_password else None
+            ),
+            starttls=settings.smtp_starttls,
+        )
+    if settings.telegram_bot_token and settings.telegram_chat_id:
+        notifiers["telegram"] = TelegramNotifier(
+            token=settings.telegram_bot_token.get_secret_value(),
+            chat_id=settings.telegram_chat_id,
+        )
+    if not notifiers:
+        return None
+    service = NotificationDeliveryService(
+        session_factory=session_factory,
+        notifiers=notifiers,
+        frontend_url=str(settings.notification_frontend_url).rstrip("/"),
+        max_attempts=settings.notification_max_attempts,
+        retry_delay=timedelta(seconds=settings.notification_retry_seconds),
+    )
+
+    async def run(digest_id: str) -> None:
+        for delivery_id in service.enqueue(digest_id):
+            await service.deliver(delivery_id)
+
+    async def retry_due() -> None:
+        for delivery_id in service.due_ids():
+            await service.deliver(delivery_id)
+
+    return run, retry_due
+
+
 def main() -> None:
     """Run the scheduler as a dedicated foreground process."""
 
     settings = Settings()
     engine = create_engine(settings.database_url)
     session_factory = sessionmaker(engine, expire_on_commit=False)
+    notification_runners = build_notification_runner(settings, session_factory)
+    digest_synthesizer = build_digest_synthesizer(settings)
     build_scheduler(
         settings,
         PipelineSchedulerServices(
             session_factory=session_factory,
             pipeline_runner=build_production_pipeline_runner(settings, session_factory),
             digest_runner=lambda cadence: run_offline_digest(
-                session_factory, cadence, settings.app_timezone
+                session_factory,
+                cadence,
+                settings.app_timezone,
+                digest_synthesizer,
+            ),
+            notification_runner=notification_runners[0] if notification_runners else None,
+            notification_retry_runner=(
+                notification_runners[1] if notification_runners else None
             ),
         ),
     ).start()

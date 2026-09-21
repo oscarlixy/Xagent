@@ -1,14 +1,158 @@
 import re
 from datetime import UTC, datetime
+from uuid import NAMESPACE_URL, uuid5
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from x_digest.ai.contracts import DigestOutput
+from x_digest.ai.openai import LLMProviderError
 from x_digest.models import Digest, DigestItem, Post, Summary
 from x_digest.repositories.transactions import ensure_sqlite_outer_transaction
+from x_digest.services.digest_candidates import load_digest_candidates
+from x_digest.services.digest_synthesis import (
+    DigestCandidate,
+    DigestSynthesizer,
+    DigestValidationError,
+    fallback_digest_output,
+    validate_digest_output,
+)
 from x_digest.services.digest_windows import DigestWindow as DigestWindow
 from x_digest.services.digest_windows import window_for as window_for
+
+
+async def generate_digest(
+    session: Session,
+    *,
+    synthesizer: DigestSynthesizer,
+    window: DigestWindow | None = None,
+    window_key: str | None = None,
+    regenerate: bool = False,
+) -> tuple[Digest, bool]:
+    if window is None and window_key is None:
+        raise ValueError("window or window_key is required")
+    key = window.key if window is not None else window_key
+    assert key is not None
+    latest = _latest_digest(session, key)
+    if latest is not None and not regenerate:
+        return latest, False
+
+    if window is None:
+        candidates: tuple[DigestCandidate, ...] = ()
+        output = fallback_digest_output(candidates)
+    else:
+        candidates = load_digest_candidates(session, window)
+        try:
+            result = await synthesizer.synthesize_digest(candidates)
+            validate_digest_output(result.output, candidates)
+            output = result.output
+        except (LLMProviderError, DigestValidationError):
+            output = fallback_digest_output(candidates)
+
+    return _persist_event_digest(
+        session,
+        window=window,
+        window_key=key,
+        output=output,
+        candidates=candidates,
+    )
+
+
+def _persist_event_digest(
+    session: Session,
+    *,
+    window: DigestWindow | None,
+    window_key: str,
+    output: DigestOutput,
+    candidates: tuple[DigestCandidate, ...],
+) -> tuple[Digest, bool]:
+    source_by_id = {
+        source.id: source for candidate in candidates for source in candidate.sources
+    }
+    for _attempt in range(20):
+        latest = _latest_digest(session, window_key)
+        digest = Digest(
+            window_key=window_key,
+            version=1 if latest is None else latest.version + 1,
+            timezone=(
+                window.timezone
+                if window is not None
+                else _timezone_from_legacy_key(window_key)
+            ),
+            window_start_at=window.start if window is not None else None,
+            window_end_at=window.end if window is not None else None,
+        )
+        ensure_sqlite_outer_transaction(session)
+        try:
+            with session.begin_nested():
+                session.add(digest)
+                session.flush()
+                rendered_topics: list[dict[str, object]] = []
+                position = 0
+                for topic_index, topic in enumerate(output.topics):
+                    rendered_events: list[dict[str, object]] = []
+                    for event_index, event in enumerate(topic.events):
+                        snapshot: dict[str, object] = {
+                            "title": event.title,
+                            "what_happened": event.what_happened,
+                            "why_it_matters": event.why_it_matters,
+                            "event_type": event.event_type,
+                            "importance": event.importance,
+                            "source_ids": list(event.source_ids),
+                            "sources": [
+                                {
+                                    "id": source_by_id[source_id].id,
+                                    "username": source_by_id[source_id].username,
+                                    "text": source_by_id[source_id].text,
+                                    "url": source_by_id[source_id].url,
+                                }
+                                for source_id in event.source_ids
+                            ],
+                        }
+                        identity = ":".join(
+                            [
+                                digest.id,
+                                str(topic_index),
+                                str(event_index),
+                                *event.source_ids,
+                            ]
+                        )
+                        item = DigestItem(
+                            digest_id=digest.id,
+                            source_type="event",
+                            source_id=str(uuid5(NAMESPACE_URL, identity)),
+                            topic=topic.name,
+                            position=position,
+                            snapshot_json=snapshot,
+                        )
+                        session.add(item)
+                        session.flush()
+                        rendered_events.append({**snapshot, "item_id": item.id})
+                        position += 1
+                    rendered_topics.append(
+                        {"name": topic.name, "events": rendered_events}
+                    )
+                digest.rendered_content = {
+                    "schema_version": "event-digest-v1",
+                    "title": _title(window, window_key),
+                    "overview": output.overview,
+                    "topics": rendered_topics,
+                    "excluded_source_ids": list(output.excluded_source_ids),
+                }
+                session.flush()
+        except IntegrityError:
+            continue
+        return digest, True
+    raise RuntimeError("digest_version_conflict")
+
+
+def _latest_digest(session: Session, window_key: str) -> Digest | None:
+    return session.scalar(
+        select(Digest)
+        .where(Digest.window_key == window_key)
+        .order_by(Digest.version.desc())
+    )
 
 
 def build_digest(
