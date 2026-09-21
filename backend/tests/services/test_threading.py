@@ -28,3 +28,20 @@ def test_posts_in_different_conversations_are_not_merged() -> None:
     )
 
     assert len(groups) == 2
+
+
+def test_same_conversation_posts_from_different_authors_are_not_merged() -> None:
+    created = datetime.now(UTC)
+
+    groups = assemble_threads(
+        [
+            ThreadPostView("1", "author-a", created, "conversation", None),
+            ThreadPostView("2", "author-b", created + timedelta(minutes=1), "conversation", "1"),
+        ]
+    )
+
+    assert len(groups) == 2
+    assert {group.id for group in groups} == {
+        "conversation:author-a",
+        "conversation:author-b",
+    }
