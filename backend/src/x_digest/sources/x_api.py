@@ -62,7 +62,7 @@ class XApiSource:
         access_token = await self._token_service.access_token()
         params = {
             "max_results": str(max_results),
-            "tweet.fields": "author_id,created_at,conversation_id,entities,referenced_tweets",
+            "post.fields": "author_id,created_at,conversation_id,entities,referenced_posts",
             "expansions": "author_id",
             "user.fields": "username,name",
         }
@@ -206,7 +206,7 @@ def _parse_post(item: object, users: Mapping[str, RawAuthor]) -> RawPost | None:
     created_at = item.get("created_at")
     conversation_id = item.get("conversation_id")
     entities = item.get("entities")
-    references = item.get("referenced_tweets")
+    references = item.get("referenced_posts", item.get("referenced_tweets"))
     if not (
         isinstance(post_id, str)
         and isinstance(author_id, str)

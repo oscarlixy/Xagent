@@ -3,9 +3,11 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from x_digest.models import Author, Post, PostListMembership
+from x_digest.repositories.transactions import ensure_sqlite_outer_transaction
 
 
 @dataclass(frozen=True)
@@ -33,12 +35,12 @@ class PostInput:
 
 
 def upsert_post(session: Session, post_input: PostInput) -> tuple[Post, bool]:
-    post = session.scalar(
-        select(Post).where(
-            Post.platform == post_input.platform,
-            Post.platform_post_id == post_input.platform_post_id,
-        )
+    ensure_sqlite_outer_transaction(session)
+    post_query = select(Post).where(
+        Post.platform == post_input.platform,
+        Post.platform_post_id == post_input.platform_post_id,
     )
+    post = session.scalar(post_query)
     if post is not None:
         return post, False
 
@@ -53,8 +55,18 @@ def upsert_post(session: Session, post_input: PostInput) -> tuple[Post, bool]:
             profile_image_url=post_input.author.profile_image_url,
             metadata_json=post_input.author.metadata_json,
         )
-        session.add(author)
-        session.flush()
+        try:
+            with session.begin_nested():
+                session.add(author)
+                session.flush()
+        except IntegrityError:
+            author = session.scalar(
+                select(Author).where(
+                    Author.platform_author_id == post_input.author.platform_author_id
+                )
+            )
+            if author is None:
+                raise
     else:
         author.username = post_input.author.username
         author.display_name = post_input.author.display_name
@@ -64,7 +76,7 @@ def upsert_post(session: Session, post_input: PostInput) -> tuple[Post, bool]:
     post = Post(
         platform=post_input.platform,
         platform_post_id=post_input.platform_post_id,
-        author=author,
+        author_id=author.id,
         text=post_input.text,
         created_at=post_input.created_at,
         source_url=post_input.source_url,
@@ -74,12 +86,20 @@ def upsert_post(session: Session, post_input: PostInput) -> tuple[Post, bool]:
         entities_json=post_input.entities_json,
         media_json=post_input.media_json,
     )
-    session.add(post)
-    session.flush()
+    try:
+        with session.begin_nested():
+            session.add(post)
+            session.flush()
+    except IntegrityError:
+        winner = session.scalar(post_query)
+        if winner is None:
+            raise
+        return winner, False
     return post, True
 
 
 def attach_to_list(session: Session, post_id: str, list_id: str) -> bool:
+    ensure_sqlite_outer_transaction(session)
     membership = session.scalar(
         select(PostListMembership).where(
             PostListMembership.post_id == post_id,
@@ -88,6 +108,17 @@ def attach_to_list(session: Session, post_id: str, list_id: str) -> bool:
     )
     if membership is not None:
         return False
-    session.add(PostListMembership(post_id=post_id, list_id=list_id))
-    session.flush()
+    try:
+        with session.begin_nested():
+            session.add(PostListMembership(post_id=post_id, list_id=list_id))
+            session.flush()
+    except IntegrityError:
+        if session.scalar(
+            select(PostListMembership).where(
+                PostListMembership.post_id == post_id,
+                PostListMembership.list_id == list_id,
+            )
+        ) is None:
+            raise
+        return False
     return True

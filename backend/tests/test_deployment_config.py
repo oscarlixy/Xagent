@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -34,6 +35,7 @@ def test_backend_services_share_one_built_image() -> None:
             "json",
         ],
         cwd=project_root,
+        env={**os.environ, "GEMINI_API_KEY": "replace-with-your-gemini-api-key"},
         capture_output=True,
         text=True,
         check=True,
@@ -59,7 +61,8 @@ def test_backend_services_share_one_built_image() -> None:
     }
     expected_oauth_environment = {
         "X_CLIENT_ID": "replace-with-your-x-oauth-client-id",
-        "X_OAUTH_REDIRECT_URI": "http://localhost:3000/api/x/callback",
+        "X_CLIENT_SECRET": "replace-with-your-x-oauth-client-secret",
+        "X_OAUTH_REDIRECT_URI": "http://127.0.0.1:3000/api/x/callback",
     }
     assert {
         name: {
@@ -71,3 +74,10 @@ def test_backend_services_share_one_built_image() -> None:
         "backend": expected_oauth_environment,
         "scheduler": expected_oauth_environment,
     }
+    assert services["backend"]["environment"]["GEMINI_API_KEY"] == (
+        "replace-with-your-gemini-api-key"
+    )
+    assert services["scheduler"]["environment"]["GEMINI_API_KEY"] == (
+        "replace-with-your-gemini-api-key"
+    )
+    assert "GEMINI_API_KEY" not in services["frontend"]["environment"]

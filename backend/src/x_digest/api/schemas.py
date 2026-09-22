@@ -149,7 +149,18 @@ class PipelineResultResponse(StrictModel):
     stages: dict[str, StageResultResponse]
 
 
+class SyncHealthResponse(StrictModel):
+    enabled_list_count: int
+    stale_list_count: int
+    stale: bool
+    status: Literal["running", "succeeded", "partial", "failed"] | None
+    last_attempt_at: datetime | None
+    last_completed_at: datetime | None
+    last_error: str | None
+
+
 class StatusResponse(StrictModel):
     latest_run: dict[str, Any] | None
     latest_summary: dict[str, Any] | None
     deliveries: dict[str, int]
+    sync_health: SyncHealthResponse

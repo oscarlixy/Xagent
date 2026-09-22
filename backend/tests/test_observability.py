@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
@@ -52,3 +52,65 @@ def test_status_snapshot_exposes_stage_metrics_without_provider_payloads_or_secr
     assert "provider_payload" not in str(snapshot)
     assert "super-secret" not in str(snapshot)
     assert "nested-secret" not in str(snapshot)
+
+
+def test_status_snapshot_marks_overdue_syncs_stale_and_exposes_safe_failure() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 9, 21, 12, tzinfo=UTC)
+    with Session(engine) as session:
+        x_list = upsert_list(
+            session,
+            platform_list_id="list-a",
+            name="AI news",
+            sync_interval_minutes=60,
+        )
+        session.add(
+            SyncRun(
+                list_id=x_list.id,
+                status="partial",
+                started_at=now - timedelta(hours=3),
+                finished_at=now - timedelta(hours=2),
+                error_code="summary_processing_failed",
+            )
+        )
+        session.commit()
+
+        snapshot = status_snapshot(session, now=now)
+
+    assert snapshot["sync_health"] == {
+        "enabled_list_count": 1,
+        "stale_list_count": 1,
+        "stale": True,
+        "status": "partial",
+        "last_attempt_at": now - timedelta(hours=2),
+        "last_completed_at": now - timedelta(hours=2),
+        "last_error": "summary_processing_failed",
+    }
+
+
+def test_status_snapshot_treats_recent_completed_sync_as_fresh() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 9, 21, 12, tzinfo=UTC)
+    with Session(engine) as session:
+        x_list = upsert_list(
+            session,
+            platform_list_id="list-a",
+            name="AI news",
+            sync_interval_minutes=60,
+        )
+        session.add(
+            SyncRun(
+                list_id=x_list.id,
+                status="succeeded",
+                started_at=now - timedelta(minutes=20),
+                finished_at=now - timedelta(minutes=15),
+            )
+        )
+        session.commit()
+
+        snapshot = status_snapshot(session, now=now)
+
+    assert snapshot["sync_health"]["stale"] is False
+    assert snapshot["sync_health"]["stale_list_count"] == 0

@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from x_digest.api.auth import require_internal_token
 from x_digest.api.errors import APIError
 from x_digest.api.schemas import ListCreate, ListResponse, ListUpdate
-from x_digest.models import PostListMembership, XList
+from x_digest.models import PostListMembership, SyncRun, XList
 
 router = APIRouter(prefix="/api/lists", dependencies=[Depends(require_internal_token)])
 
@@ -51,6 +51,7 @@ class ListService:
         self._session.execute(
             delete(PostListMembership).where(PostListMembership.list_id == list_id)
         )
+        self._session.execute(delete(SyncRun).where(SyncRun.list_id == list_id))
         self._session.delete(x_list)
         self._session.commit()
 

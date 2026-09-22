@@ -27,3 +27,23 @@ def test_fake_summarizer_persists_one_summary_per_content_fingerprint() -> None:
         assert first.id == second.id
         assert first.summary
         assert session.scalars(select(Summary)).all() == [first]
+
+
+def test_concurrent_failure_does_not_downgrade_a_successful_summary() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    content = NormalizedContent(source_ids=("101",), text="Stable summary")
+
+    with Session(engine) as session:
+        summarizer = DeterministicSummarizer()
+        service = SummarizationService(session=session, summarizer=summarizer)
+        succeeded, _ = asyncio.run(service.summarize(content))
+        SummarizationService.record_failure(
+            session=session,
+            summarizer=summarizer,
+            content=content,
+            failure_code="summary_processing_failed",
+        )
+
+        assert succeeded.status == "succeeded"
+        assert succeeded.failure_code is None

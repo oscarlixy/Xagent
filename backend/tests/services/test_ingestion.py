@@ -59,6 +59,106 @@ def test_fake_source_sync_is_idempotent_and_advances_watermark() -> None:
         assert len(session.scalars(select(Post)).all()) == 2
 
 
+def test_sync_stops_after_a_whole_page_is_older_than_watermark_overlap() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(engine)
+    now = datetime.now(UTC)
+    with session_factory.begin() as session:
+        x_list = upsert_list(session, platform_list_id="123456789", name="AI news")
+        x_list.latest_seen_at = now
+        x_list.latest_seen_post_id = "watermark"
+        list_id = x_list.id
+
+    source = FakeXSource(
+        {
+            None: SourcePage(
+                posts=(_raw_post("new", now + timedelta(minutes=1)),), next_token="p2"
+            ),
+            "p2": SourcePage(
+                posts=(_raw_post("overlap", now - timedelta(minutes=11)),),
+                next_token="p3",
+            ),
+            "p3": SourcePage(posts=(_raw_post("too-old", now - timedelta(days=1)),)),
+        }
+    )
+
+    result = asyncio.run(
+        IngestionService(
+            session_factory=session_factory,
+            source=source,
+            overlap=timedelta(minutes=10),
+        ).sync_list(list_id)
+    )
+
+    assert result.pages_fetched == 2
+    assert [call[1] for call in source.calls] == [None, "p2"]
+    with session_factory() as session:
+        assert {post.platform_post_id for post in session.scalars(select(Post))} == {
+            "new",
+            "overlap",
+        }
+
+
+def test_rejected_only_page_does_not_trigger_watermark_stop() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(engine)
+    now = datetime.now(UTC)
+    with session_factory.begin() as session:
+        x_list = upsert_list(session, platform_list_id="123456789", name="AI news")
+        x_list.latest_seen_at = now
+        list_id = x_list.id
+
+    source = FakeXSource(
+        {
+            None: SourcePage(
+                rejected_items=(RejectedItem(identifier="hidden", reason="provider_rejected"),),
+                next_token="p2",
+            ),
+            "p2": SourcePage(posts=(_raw_post("old", now - timedelta(hours=1)),)),
+        }
+    )
+
+    result = asyncio.run(
+        IngestionService(
+            session_factory=session_factory,
+            source=source,
+            overlap=timedelta(minutes=10),
+        ).sync_list(list_id)
+    )
+
+    assert result.pages_fetched == 2
+    assert [call[1] for call in source.calls] == [None, "p2"]
+
+
+def test_old_overlap_page_does_not_move_watermark_backwards() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(engine)
+    now = datetime.now(UTC)
+    with session_factory.begin() as session:
+        x_list = upsert_list(session, platform_list_id="123456789", name="AI news")
+        x_list.latest_seen_at = now
+        x_list.latest_seen_post_id = "watermark"
+        list_id = x_list.id
+
+    result = asyncio.run(
+        IngestionService(
+            session_factory=session_factory,
+            source=FakeXSource(
+                {None: SourcePage(posts=(_raw_post("old", now - timedelta(hours=1)),))}
+            ),
+        ).sync_list(list_id)
+    )
+
+    assert result.status == "succeeded"
+    with session_factory() as session:
+        x_list = session.get(XList, list_id)
+        assert x_list is not None
+        assert x_list.latest_seen_post_id == "watermark"
+
+
 def test_source_fetch_happens_outside_an_active_database_transaction() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -499,4 +599,14 @@ def _single_post_page(now: datetime) -> SourcePage:
                 source_url="https://x.com/author/status/101",
             ),
         )
+    )
+
+
+def _raw_post(post_id: str, created_at: datetime) -> RawPost:
+    return RawPost(
+        id=post_id,
+        author=RawAuthor(id=f"author-{post_id}", username=f"author_{post_id}"),
+        text=f"post {post_id}",
+        created_at=created_at,
+        source_url=f"https://x.com/author_{post_id}/status/{post_id}",
     )

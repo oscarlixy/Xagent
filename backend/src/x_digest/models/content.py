@@ -20,6 +20,9 @@ from x_digest.models.source import Base, Post, new_id
 
 class Thread(Base):
     __tablename__ = "threads"
+    __table_args__ = (
+        UniqueConstraint("conversation_id", "author_id", name="uq_thread_conversation_author"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     conversation_id: Mapped[str | None] = mapped_column(String(32), index=True)
@@ -55,6 +58,8 @@ class Link(Base):
     title: Mapped[str | None] = mapped_column(String(1024))
     extracted_text: Mapped[str | None] = mapped_column(Text)
     error_code: Mapped[str | None] = mapped_column(String(128))
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     post: Mapped[Post] = relationship()
 
@@ -100,6 +105,8 @@ class Digest(Base):
     window_key: Mapped[str] = mapped_column(String(128), nullable=False)
     version: Mapped[int] = mapped_column(Integer, nullable=False)
     timezone: Mapped[str] = mapped_column(String(64), default="UTC", nullable=False)
+    window_start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    window_end_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     rendered_content: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     status: Mapped[str] = mapped_column(String(32), default="succeeded", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.now)

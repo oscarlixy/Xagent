@@ -47,12 +47,14 @@ def _client(
     handler: Callable[[httpx.Request], httpx.Response],
     *,
     now: datetime = NOW,
+    client_secret: SecretStr | None = None,
 ) -> tuple[XOAuthClient, httpx.AsyncClient]:
     http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     return (
         XOAuthClient(
             session_factory=session_factory,
             client_id="test-client-id",
+            client_secret=client_secret,
             redirect_uri="https://reader.test/api/x/callback",
             encryption_key=FERNET_KEY,
             http_client=http_client,
@@ -120,6 +122,37 @@ def test_exchange_code_posts_the_pkce_form_and_persists_valid_tokens(
     }
 
 
+def test_confidential_exchange_uses_basic_auth_and_omits_client_id_from_form(
+    session_factory: sessionmaker[Session],
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=_token_payload())
+
+    service, http_client = _client(
+        session_factory,
+        handler,
+        client_secret=SecretStr("test-client-secret"),
+    )
+    try:
+        asyncio.run(service.exchange_code(code="test-code-secret", verifier="test-verifier-secret"))
+    finally:
+        asyncio.run(http_client.aclose())
+
+    assert len(requests) == 1
+    assert requests[0].headers["authorization"] == (
+        "Basic dGVzdC1jbGllbnQtaWQ6dGVzdC1jbGllbnQtc2VjcmV0"
+    )
+    assert _form(requests[0]) == {
+        "grant_type": ["authorization_code"],
+        "code": ["test-code-secret"],
+        "redirect_uri": ["https://reader.test/api/x/callback"],
+        "code_verifier": ["test-verifier-secret"],
+    }
+
+
 def test_access_token_does_not_refresh_before_the_margin(
     session_factory: sessionmaker[Session],
 ) -> None:
@@ -169,6 +202,44 @@ def test_access_token_refreshes_once_at_the_margin(
     assert _form(requests[0]) == {
         "grant_type": ["refresh_token"],
         "client_id": ["test-client-id"],
+        "refresh_token": ["test-refresh-alpha"],
+    }
+
+
+def test_confidential_refresh_uses_basic_auth_and_omits_client_id_from_form(
+    session_factory: sessionmaker[Session],
+) -> None:
+    _seed(session_factory)
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json=_token_payload(
+                access_token="test-access-beta",
+                refresh_token="test-refresh-beta",
+            ),
+        )
+
+    service, http_client = _client(
+        session_factory,
+        handler,
+        now=NOW + timedelta(minutes=59),
+        client_secret=SecretStr("test-client-secret"),
+    )
+    try:
+        token = asyncio.run(service.access_token())
+    finally:
+        asyncio.run(http_client.aclose())
+
+    assert token == "test-access-beta"
+    assert len(requests) == 1
+    assert requests[0].headers["authorization"] == (
+        "Basic dGVzdC1jbGllbnQtaWQ6dGVzdC1jbGllbnQtc2VjcmV0"
+    )
+    assert _form(requests[0]) == {
+        "grant_type": ["refresh_token"],
         "refresh_token": ["test-refresh-alpha"],
     }
 

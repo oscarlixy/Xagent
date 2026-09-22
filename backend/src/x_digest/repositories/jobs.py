@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import UTC, datetime
 
 from sqlalchemy.orm import Session
 
@@ -29,7 +29,17 @@ def advance_list_watermark(
 ) -> bool:
     if sync_run.status != "succeeded":
         return False
+    if x_list.latest_seen_at is not None and (
+        _as_utc(latest_seen_at), latest_seen_post_id
+    ) <= (_as_utc(x_list.latest_seen_at), x_list.latest_seen_post_id or ""):
+        return False
     x_list.latest_seen_at = latest_seen_at
     x_list.latest_seen_post_id = latest_seen_post_id
     session.flush()
     return True
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)

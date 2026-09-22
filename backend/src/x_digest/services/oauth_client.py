@@ -69,12 +69,14 @@ class XOAuthClient:
         client_id: str | None,
         redirect_uri: object | None,
         encryption_key: SecretStr | None,
+        client_secret: SecretStr | None = None,
         http_client: httpx.AsyncClient | None = None,
         clock: Clock | None = None,
         token_url: str = DEFAULT_TOKEN_URL,
     ) -> None:
         self._session_factory = session_factory
         self._client_id = client_id
+        self._client_secret = client_secret
         self._redirect_uri = str(redirect_uri) if redirect_uri is not None else None
         self._encryption_key = encryption_key
         self._http_client = http_client or httpx.AsyncClient(timeout=10.0)
@@ -88,15 +90,15 @@ class XOAuthClient:
 
     async def exchange_code(self, *, code: str, verifier: str) -> OAuthCredentialView:
         client_id, redirect_uri = self._configuration()
-        payload = await self._request_tokens(
-            {
-                "grant_type": "authorization_code",
-                "client_id": client_id,
-                "code": code,
-                "redirect_uri": redirect_uri,
-                "code_verifier": verifier,
-            }
-        )
+        form = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "code_verifier": verifier,
+        }
+        if self._client_secret is None:
+            form["client_id"] = client_id
+        payload = await self._request_tokens(form)
         async with _PROCESS_CREDENTIAL_WRITE_LOCK:
             with self._session_factory.begin() as session:
                 vault = self._vault(session)
@@ -127,13 +129,13 @@ class XOAuthClient:
                         return credential.access_token
 
             client_id, _redirect_uri = self._configuration()
-            payload = await self._request_tokens(
-                {
-                    "grant_type": "refresh_token",
-                    "client_id": client_id,
-                    "refresh_token": credential.refresh_token,
-                }
-            )
+            form = {
+                "grant_type": "refresh_token",
+                "refresh_token": credential.refresh_token,
+            }
+            if self._client_secret is None:
+                form["client_id"] = client_id
+            payload = await self._request_tokens(form)
 
             async with _PROCESS_CREDENTIAL_WRITE_LOCK:
                 with self._session_factory.begin() as session:
@@ -196,7 +198,14 @@ class XOAuthClient:
 
     async def _request_tokens(self, form: Mapping[str, str]) -> Mapping[str, object]:
         try:
-            response = await self._http_client.post(self._token_url, data=form)
+            if self._client_secret is not None and self._client_id is not None:
+                auth = httpx.BasicAuth(
+                    self._client_id,
+                    self._client_secret.get_secret_value(),
+                )
+                response = await self._http_client.post(self._token_url, data=form, auth=auth)
+            else:
+                response = await self._http_client.post(self._token_url, data=form)
         except httpx.RequestError:
             raise _upstream_error() from None
 

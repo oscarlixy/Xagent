@@ -26,6 +26,7 @@ def _build_source(settings: Settings) -> tuple[XApiSource, XOAuthClient]:
     client = XOAuthClient(
         session_factory=session_factory,
         client_id=settings.x_client_id,
+        client_secret=settings.x_client_secret,
         redirect_uri=settings.x_oauth_redirect_uri,
         encryption_key=settings.x_token_encryption_key,
     )

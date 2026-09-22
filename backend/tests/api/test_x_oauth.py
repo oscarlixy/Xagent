@@ -29,12 +29,15 @@ def _session_factory() -> sessionmaker[Session]:
     return sessionmaker(engine, expire_on_commit=False)
 
 
-def _settings(*, configured: bool = True) -> Settings:
+def _settings(
+    *, configured: bool = True, client_secret: SecretStr | None = None
+) -> Settings:
     return Settings(
         _env_file=None,
         database_url="sqlite+pysqlite:///:memory:",
         internal_api_token=SecretStr(INTERNAL_TOKEN),
         x_client_id="test-client-id" if configured else None,
+        x_client_secret=client_secret,
         x_oauth_redirect_uri="https://reader.test/api/x/callback" if configured else None,
         x_token_encryption_key=FERNET_KEY if configured else None,
     )
@@ -44,13 +47,14 @@ def _request(
     handler: Callable[[httpx.Request], httpx.Response],
     *,
     configured: bool = True,
+    client_secret: SecretStr | None = None,
     headers: dict[str, str] | None = None,
     payload: dict[str, object] | None = None,
 ) -> tuple[httpx.Response, sessionmaker[Session]]:
     factory = _session_factory()
     http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     app = create_app(
-        settings=_settings(configured=configured),
+        settings=_settings(configured=configured, client_secret=client_secret),
         session_factory=factory,
         oauth_http_client=http_client,
         oauth_clock=lambda: NOW,
@@ -105,6 +109,26 @@ def test_callback_returns_empty_204_and_persists_only_encrypted_tokens() -> None
         assert stored is not None
         assert b"test-access-secret" not in stored.encrypted_access_token
         assert b"test-refresh-secret" not in stored.encrypted_refresh_token
+
+
+def test_callback_passes_configured_client_secret_to_the_oauth_client() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return _success(request)
+
+    response, _factory = _request(
+        handler,
+        client_secret=SecretStr("test-client-secret"),
+        headers={"Authorization": f"Bearer {INTERNAL_TOKEN}"},
+    )
+
+    assert response.status_code == 204
+    assert len(requests) == 1
+    assert requests[0].headers["authorization"] == (
+        "Basic dGVzdC1jbGllbnQtaWQ6dGVzdC1jbGllbnQtc2VjcmV0"
+    )
 
 
 def test_callback_rejects_extra_json_fields_without_contacting_x() -> None:

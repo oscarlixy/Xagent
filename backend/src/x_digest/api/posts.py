@@ -86,9 +86,11 @@ class PostService:
                     and_(Post.created_at == cursor_time, Post.id < cursor_id),
                 )
             )
-        posts = self._session.scalars(
-            statement.distinct().order_by(Post.created_at.desc(), Post.id.desc())
-        ).all()
+        posts = (
+            self._session.scalars(statement.order_by(Post.created_at.desc(), Post.id.desc()))
+            .unique()
+            .all()
+        )
         topics_by_post = self._topics_by_post()
         if topic is not None:
             posts = [post for post in posts if topic in topics_by_post.get(post.id, set())]

@@ -1,6 +1,6 @@
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 from sqlalchemy import select
@@ -55,11 +55,15 @@ class IngestionService:
         source: XSource,
         max_pages: int = 5,
         max_posts: int = 500,
+        overlap: timedelta = timedelta(minutes=10),
     ) -> None:
+        if overlap < timedelta(0):
+            raise ValueError("overlap must not be negative")
         self._session_factory = session_factory
         self._source = source
         self._max_pages = max_pages
         self._max_posts = max_posts
+        self._overlap = overlap
 
     async def sync_list(self, list_id: str) -> SyncResult:
         with self._session_factory() as session:
@@ -67,6 +71,11 @@ class IngestionService:
             if x_list is None:
                 raise ValueError(f"Unknown List: {list_id}")
             platform_list_id = x_list.platform_list_id
+            watermark_cutoff = (
+                _as_utc(x_list.latest_seen_at) - self._overlap
+                if x_list.latest_seen_at is not None
+                else None
+            )
 
         self._reconcile_stale_runs(list_id)
         with self._session_factory.begin() as session:
@@ -99,6 +108,10 @@ class IngestionService:
                     if durable_run is not None:  # pragma: no branch - the run was just created
                         self._record_counts(durable_run, candidate)
                 result = candidate
+                if watermark_cutoff is not None and page.posts and all(
+                    _as_utc(post.created_at) < watermark_cutoff for post in page.posts
+                ):
+                    break
                 if page.next_token is None:
                     break
                 pagination_token = page.next_token
@@ -264,3 +277,9 @@ def _safe_failure_code(error: Exception) -> str:
     if isinstance(error, OAuthClientError) and error.code in _SAFE_OAUTH_ERROR_CODES:
         return error.code
     return _GENERIC_FAILURE_CODE
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)

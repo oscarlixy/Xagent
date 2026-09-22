@@ -30,8 +30,6 @@ export default defineConfig({
       reuseExistingServer: false,
       timeout: 30_000,
       env: {
-        OPERATOR_USERNAME: "reader",
-        OPERATOR_PASSWORD: "correct-horse-battery-staple",
         BACKEND_INTERNAL_URL: "http://127.0.0.1:9100",
         INTERNAL_API_TOKEN: token,
         ...oauthEnvironment,
@@ -43,8 +41,6 @@ export default defineConfig({
       reuseExistingServer: false,
       timeout: 30_000,
       env: {
-        OPERATOR_USERNAME: "reader",
-        OPERATOR_PASSWORD: "correct-horse-battery-staple",
         BACKEND_INTERNAL_URL: "http://127.0.0.1:9100",
         INTERNAL_API_TOKEN: token,
       },
@@ -55,8 +51,6 @@ export default defineConfig({
       reuseExistingServer: false,
       timeout: 30_000,
       env: {
-        OPERATOR_USERNAME: "reader",
-        OPERATOR_PASSWORD: "correct-horse-battery-staple",
         BACKEND_INTERNAL_URL: "http://127.0.0.1:9100",
         INTERNAL_API_TOKEN: token,
         ...oauthEnvironment,

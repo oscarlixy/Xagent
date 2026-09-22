@@ -41,7 +41,7 @@ def _response_payload() -> dict[str, object]:
                 "created_at": "2026-09-12T08:00:00.000Z",
                 "conversation_id": "conversation-1",
                 "entities": {"urls": []},
-                "referenced_tweets": [{"type": "retweeted", "id": "original-1"}],
+                "referenced_posts": [{"type": "reposted", "id": "original-1"}],
             }
         ],
         "includes": {"users": [{"id": "author-1", "username": "alice", "name": "Alice"}]},
@@ -93,7 +93,7 @@ def test_fetch_page_uses_oauth_and_exact_list_query_without_repost_lookups() -> 
     assert dict(requests[0].url.params) == {
         "max_results": "25",
         "pagination_token": "page-before",
-        "tweet.fields": "author_id,created_at,conversation_id,entities,referenced_tweets",
+        "post.fields": "author_id,created_at,conversation_id,entities,referenced_posts",
         "expansions": "author_id",
         "user.fields": "username,name",
     }
@@ -102,8 +102,23 @@ def test_fetch_page_uses_oauth_and_exact_list_query_without_repost_lookups() -> 
     assert page.request_id == "request-1"
     assert len(page.posts) == 1
     assert page.posts[0].author.username == "alice"
-    assert page.posts[0].references == [{"type": "retweeted", "id": "original-1"}]
+    assert page.posts[0].references == [{"type": "reposted", "id": "original-1"}]
     assert page.posts[0].source_url == "https://x.com/alice/status/tweet-1"
+
+
+def test_fetch_page_accepts_legacy_referenced_tweets_during_api_transition() -> None:
+    payload = _response_payload()
+    item = payload["data"][0]  # type: ignore[index]
+    item["referenced_tweets"] = item.pop("referenced_posts")  # type: ignore[union-attr]
+    source, _tokens, client = _source(lambda _request: httpx.Response(200, json=payload))
+    try:
+        page = asyncio.run(
+            source.fetch_page(list_id=LIST_ID, pagination_token=None, max_results=1)
+        )
+    finally:
+        asyncio.run(client.aclose())
+
+    assert page.posts[0].references == [{"type": "reposted", "id": "original-1"}]
 
 
 def test_fetch_page_accepts_valid_data_and_converts_provider_item_errors_safely() -> None:
@@ -346,6 +361,34 @@ def test_preflight_outputs_only_safe_json_and_uses_one_result(
     assert output.getvalue() == '{"status":"ok","count":0,"request_id":"request-only"}\n'
     assert SECRET not in output.getvalue()
     assert probe_source.calls == [(LIST_ID, None, 1)]
+
+
+def test_preflight_passes_client_secret_to_oauth_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pydantic import SecretStr
+
+    script = Path(__file__).parents[2] / "scripts" / "check_x_access.py"
+    spec = importlib.util.spec_from_file_location("check_x_access_secret", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    captured: dict[str, object] = {}
+
+    class ProbeClient:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(module, "XOAuthClient", ProbeClient)
+    settings = module.Settings(
+        x_client_id="client-id",
+        x_client_secret=SecretStr("client-secret"),
+    )
+    _source_instance, _client = module._build_source(settings)
+
+    secret = captured["client_secret"]
+    assert isinstance(secret, SecretStr)
+    assert secret.get_secret_value() == "client-secret"
 
 
 def test_preflight_constructs_fetches_and_closes_resources_in_one_event_loop(

@@ -9,16 +9,16 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from x_digest.ai.contracts import SummaryOutput
+from x_digest.ai.contracts import SummaryOutput, SummaryProviderResult
 from x_digest.api.auth import require_internal_token
 from x_digest.api.errors import APIError
 from x_digest.api.schemas import PipelineResultResponse, SummaryResponse
 from x_digest.models import Post, Summary, ThreadPost, XList
 from x_digest.services.pipeline import PipelineResult
 from x_digest.services.summarization import (
-    DeterministicSummarizer,
     NormalizedContent,
     SummarizationService,
+    Summarizer,
 )
 
 router = APIRouter(prefix="/api", dependencies=[Depends(require_internal_token)])
@@ -39,7 +39,7 @@ class JobService:
         *,
         session: Session,
         pipeline: PipelineRunner,
-        summarizer: DeterministicSummarizer,
+        summarizer: Summarizer,
     ) -> None:
         self._session = session
         self._pipeline = pipeline
@@ -72,8 +72,17 @@ class JobService:
             default=None,
         )
         content = self._normalized_unit(post, latest)
-        output = await self._summarizer.summarize(content)
+        # Release the read transaction before waiting on the external provider.
+        self._session.rollback()
+        provider_result = await self._summarizer.summarize(content)
+        if isinstance(provider_result, SummaryProviderResult):
+            output = provider_result.output
+            token_usage = dict(provider_result.token_usage or {})
+        else:
+            output = provider_result
+            token_usage = {}
         self._validate_output(output, content.source_ids)
+        token_usage["idempotency_request_fingerprint"] = request_fingerprint
         summary = Summary(
             content_fingerprint=(
                 latest.content_fingerprint
@@ -90,7 +99,7 @@ class JobService:
             importance=output.importance,
             language=output.language,
             source_ids=output.source_ids,
-            token_usage={"idempotency_request_fingerprint": request_fingerprint},
+            token_usage=token_usage,
             status="succeeded",
         )
         self._session.add(summary)
