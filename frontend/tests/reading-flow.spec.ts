@@ -319,6 +319,7 @@ test("renders event digests as ordered topics with source-aligned cards", async 
   await expect(page.locator("[data-event-id='event-agent'] .source-link")).toHaveCount(2);
   await expect(page.locator("[data-event-id='event-agent'] .source-link").nth(0)).toContainText("@alice");
   await expect(page.locator("[data-event-id='event-agent'] .source-link").nth(1)).toContainText("@bob");
+  await expect(page.locator("[data-event-id='event-agent']")).toContainText("Alice、Bob · 2 条来源");
   await expect(page.locator("[data-event-id='event-opinion'] .source-link")).toHaveCount(1);
 });
 

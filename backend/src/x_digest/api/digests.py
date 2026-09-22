@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from datetime import UTC
 
 from fastapi import APIRouter, Depends, Request, status
 from sqlalchemy import select
@@ -52,19 +53,30 @@ class DigestService:
             raise APIError(404, "digest_not_found", "Digest not found")
         if self._digest_synthesizer is None:
             raise RuntimeError("digest_synthesizer_not_configured")
-        window = None
-        if existing.window_start_at is not None and existing.window_end_at is not None:
-            window = DigestWindow(
-                start=existing.window_start_at,
-                end=existing.window_end_at,
-                cadence="6h" if existing.window_key.endswith("/6h") else "daily",
-                timezone=existing.timezone,
+        if existing.window_start_at is None or existing.window_end_at is None:
+            raise APIError(
+                409,
+                "digest_regeneration_unavailable",
+                "This legacy digest does not contain a recoverable time window",
             )
+        window = DigestWindow(
+            start=(
+                existing.window_start_at.replace(tzinfo=UTC)
+                if existing.window_start_at.tzinfo is None
+                else existing.window_start_at
+            ),
+            end=(
+                existing.window_end_at.replace(tzinfo=UTC)
+                if existing.window_end_at.tzinfo is None
+                else existing.window_end_at
+            ),
+            cadence="6h" if existing.window_key.endswith("/6h") else "daily",
+            timezone=existing.timezone,
+        )
         digest, _ = await generate_digest(
             self._session,
             synthesizer=self._digest_synthesizer,
             window=window,
-            window_key=None if window is not None else existing.window_key,
             regenerate=True,
         )
         self._session.commit()

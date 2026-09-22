@@ -13,7 +13,11 @@ def load_digest_candidates(
     session: Session, window: DigestWindow
 ) -> tuple[DigestCandidate, ...]:
     units = _units_in_window(session, window)
-    return tuple(_candidate_from_unit(session, unit) for unit in units)
+    summaries = _latest_summaries_by_source_ids(session)
+    return tuple(
+        _candidate_from_unit(unit, summaries.get(frozenset(post.id for post in unit)))
+        for unit in units
+    )
 
 
 def _units_in_window(session: Session, window: DigestWindow) -> tuple[tuple[Post, ...], ...]:
@@ -52,19 +56,24 @@ def _units_in_window(session: Session, window: DigestWindow) -> tuple[tuple[Post
     return tuple(units)
 
 
-def _latest_exact_summary(session: Session, source_ids: tuple[str, ...]) -> Summary | None:
-    expected = set(source_ids)
+def _latest_summaries_by_source_ids(
+    session: Session,
+) -> dict[frozenset[str], Summary]:
     summaries = session.scalars(
         select(Summary)
         .where(Summary.status == "succeeded")
         .order_by(Summary.created_at.desc(), Summary.generation.desc(), Summary.id.desc())
     ).all()
-    return next((summary for summary in summaries if set(summary.source_ids) == expected), None)
+    latest: dict[frozenset[str], Summary] = {}
+    for summary in summaries:
+        latest.setdefault(frozenset(summary.source_ids), summary)
+    return latest
 
 
-def _candidate_from_unit(session: Session, posts: Sequence[Post]) -> DigestCandidate:
+def _candidate_from_unit(
+    posts: Sequence[Post], summary: Summary | None
+) -> DigestCandidate:
     source_ids = tuple(post.id for post in posts)
-    summary = _latest_exact_summary(session, source_ids)
     sources = tuple(
         DigestSource(
             id=post.id,

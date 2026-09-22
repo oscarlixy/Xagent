@@ -18,6 +18,12 @@ const eventTypeLabel = {
 export function DigestEventCard({ eventItemId, event, sources }: DigestEventCardProps) {
   const liveSources = new Map(sources.map((source) => [source.id, source]));
   const savedSources = new Map(event.sources.map((source) => [source.id, source]));
+  const sourceNames = event.source_ids
+    .map((sourceId) => {
+      const live = liveSources.get(sourceId);
+      return live?.author.display_name || live?.author.username || savedSources.get(sourceId)?.username;
+    })
+    .filter((name): name is string => Boolean(name));
 
   return (
     <article className="digest-event" data-event-id={eventItemId}>
@@ -35,12 +41,15 @@ export function DigestEventCard({ eventItemId, event, sources }: DigestEventCard
           <p>{event.why_it_matters}</p>
         </section>
       </div>
+      <p className="event-source-summary">
+        {sourceNames.join("、")} · {event.source_ids.length} 条来源
+      </p>
       <div className="event-sources" aria-label="事件来源">
         {event.source_ids.map((sourceId) => {
           const live = liveSources.get(sourceId);
           const saved = savedSources.get(sourceId);
           const username = live?.author.username || saved?.username;
-          const sourceUrl = trustedSourceUrl(live?.source_url || saved?.url);
+          const sourceUrl = trustedSourceUrl(live?.source_url) || trustedSourceUrl(saved?.url);
           const label = username ? `查看 @${username} 的原文` : "查看原文";
           return sourceUrl ? (
             <a

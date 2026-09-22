@@ -56,6 +56,7 @@ async def generate_digest(
         window_key=key,
         output=output,
         candidates=candidates,
+        regenerate=regenerate,
     )
 
 
@@ -66,12 +67,15 @@ def _persist_event_digest(
     window_key: str,
     output: DigestOutput,
     candidates: tuple[DigestCandidate, ...],
+    regenerate: bool,
 ) -> tuple[Digest, bool]:
     source_by_id = {
         source.id: source for candidate in candidates for source in candidate.sources
     }
     for _attempt in range(20):
         latest = _latest_digest(session, window_key)
+        if latest is not None and not regenerate:
+            return latest, False
         digest = Digest(
             window_key=window_key,
             version=1 if latest is None else latest.version + 1,

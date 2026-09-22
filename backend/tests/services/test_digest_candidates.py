@@ -1,6 +1,6 @@
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session
 
 from x_digest.models import Author, Base, Post, Summary, Thread, ThreadPost
@@ -183,3 +183,56 @@ def test_thread_with_reply_in_window_includes_root_before_window() -> None:
         assert len(candidates) == 1
         assert candidates[0].source_ids == (root.id, reply.id)
         assert candidates[0].summary_id == exact_summary.id
+
+
+def test_candidate_loading_queries_summaries_once_for_the_window() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    digest_window = window()
+    with Session(engine) as session:
+        author = Author(platform_author_id="query-author", username="query-author")
+        session.add(author)
+        session.flush()
+        posts = [
+            post(
+                author,
+                f"query-{index}",
+                digest_window.start + timedelta(hours=index + 1),
+                text=f"post {index}",
+                conversation_id=f"query-conversation-{index}",
+            )
+            for index in range(4)
+        ]
+        session.add_all(posts)
+        session.flush()
+        session.add_all(
+            summary(
+                f"query-summary-{index}",
+                [current.id],
+                text=f"summary {index}",
+                created_at=digest_window.start + timedelta(hours=index + 5),
+            )
+            for index, current in enumerate(posts)
+        )
+        session.flush()
+        statements: list[str] = []
+
+        def capture_summary_queries(
+            _connection: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _executemany: bool,
+        ) -> None:
+            if "FROM summaries" in statement:
+                statements.append(statement)
+
+        event.listen(engine, "before_cursor_execute", capture_summary_queries)
+        try:
+            candidates = load_digest_candidates(session, digest_window)
+        finally:
+            event.remove(engine, "before_cursor_execute", capture_summary_queries)
+
+        assert len(candidates) == 4
+        assert len(statements) == 1

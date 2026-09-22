@@ -16,7 +16,7 @@ class SummaryOutput(BaseModel):
 
 
 class DigestEventOutput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     title: str = Field(min_length=1)
     what_happened: str = Field(min_length=1)
@@ -27,14 +27,14 @@ class DigestEventOutput(BaseModel):
 
 
 class DigestTopicOutput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     name: str = Field(min_length=1)
     events: list[DigestEventOutput] = Field(min_length=1)
 
 
 class DigestOutput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     overview: str = Field(min_length=1)
     topics: list[DigestTopicOutput]

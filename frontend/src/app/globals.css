@@ -60,6 +60,7 @@ button:disabled { cursor: wait; opacity: .6; }
 .event-explanation h4 { color: var(--accent-dark); font-size: .8rem; letter-spacing: .08em; margin-bottom: .4rem; text-transform: uppercase; }
 .event-explanation p { line-height: 1.65; margin-top: 0; }
 .event-sources { display: flex; flex-wrap: wrap; gap: .75rem; }
+.event-source-summary { color: var(--muted); font-size: .9rem; font-weight: 700; }
 .event-type { background: #dfece5; border-radius: 999px; color: var(--accent-dark); flex: none; font-size: .75rem; font-weight: 700; padding: .25rem .55rem; }
 .source-label { color: var(--muted); font-weight: 700; padding: .4rem 0; }
 .pagination-actions { display: flex; justify-content: center; padding: 1.5rem 0; }

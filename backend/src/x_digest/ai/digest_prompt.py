@@ -6,6 +6,9 @@ DIGEST_PROMPT_VERSION = "event-digest-v1"
 
 DIGEST_SYSTEM_INSTRUCTIONS = """You create a Chinese reading digest from X source units.
 Organize the digest as topic -> event.
+Merge source units only when they describe the same real-world event.
+Keep different developments as separate events even when they share a topic.
+Use the overview only for cross-event orientation; do not repeat an event as the overview.
 For every retained event, write a concrete title, what_happened, and why_it_matters in Chinese.
 Filter pure promotion, podcast previews without a substantive claim, simple reposts, duplicate
 announcements, and low-information reactions.

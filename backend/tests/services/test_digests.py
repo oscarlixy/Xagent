@@ -273,6 +273,28 @@ class RaisingDigestSynthesizer:
         raise self.error
 
 
+class WinningDigestSynthesizer(FakeDigestSynthesizer):
+    def __init__(self, session: Session, window: DigestWindow, output: DigestOutput) -> None:
+        super().__init__(output)
+        self._session = session
+        self._window = window
+
+    async def synthesize_digest(self, candidates):
+        result = await super().synthesize_digest(candidates)
+        self._session.add(
+            Digest(
+                window_key=self._window.key,
+                version=1,
+                timezone=self._window.timezone,
+                window_start_at=self._window.start,
+                window_end_at=self._window.end,
+                rendered_content={"title": "concurrent winner"},
+            )
+        )
+        self._session.flush()
+        return result
+
+
 def _event_fixture(session: Session) -> tuple[DigestWindow, list[Post]]:
     window = DigestWindow(
         start=datetime(2026, 9, 16, 0, tzinfo=UTC),
@@ -457,6 +479,23 @@ def test_generate_digest_is_idempotent_and_regeneration_keeps_version_one() -> N
         assert regenerated.version == 2
         assert first.version == 1
         assert first.rendered_content == first_content
+
+
+def test_non_regeneration_returns_concurrent_winner_after_synthesis() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        window, posts = _event_fixture(session)
+        synthesizer = WinningDigestSynthesizer(session, window, _event_output(posts))
+
+        digest, created = asyncio.run(
+            generate_digest(session, synthesizer=synthesizer, window=window)
+        )
+
+        assert created is False
+        assert digest.version == 1
+        assert digest.rendered_content == {"title": "concurrent winner"}
+        assert session.scalars(select(Digest)).all() == [digest]
 
 
 def test_generate_digest_with_all_candidates_excluded_has_no_items() -> None:

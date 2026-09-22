@@ -156,8 +156,18 @@ def api() -> tuple[TestClient, sessionmaker[Session], dict[str, str]]:
                 SyncRun(list_id=ai_list.id, status="succeeded"),
             ]
         )
-        first_digest = Digest(window_key="2026-09-11/UTC/24h", version=1)
-        second_digest = Digest(window_key="2026-09-11/UTC/24h", version=2)
+        digest_window = {
+            "timezone": "UTC",
+            "window_start_at": now - timedelta(hours=6),
+            "window_end_at": now,
+        }
+        digest_window_key = "2026-09-11T06:00:00Z/UTC/daily"
+        first_digest = Digest(
+            window_key=digest_window_key, version=1, **digest_window
+        )
+        second_digest = Digest(
+            window_key=digest_window_key, version=2, **digest_window
+        )
         session.add_all([first_digest, second_digest])
         session.flush()
         session.add(
@@ -442,6 +452,25 @@ def test_digest_version_retrieval_and_regeneration(api) -> None:
     missing = client.get("/api/digests/missing", headers=AUTH)
     assert missing.status_code == 404
     assert missing.json()["code"] == "digest_not_found"
+
+
+def test_legacy_digest_without_window_bounds_cannot_be_regenerated(api) -> None:
+    client, factory, _ids = api
+    with factory.begin() as session:
+        legacy = Digest(window_key="legacy-window", version=1)
+        session.add(legacy)
+        session.flush()
+        legacy_id = legacy.id
+
+    response = client.post(f"/api/digests/{legacy_id}/regenerate", headers=AUTH)
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "digest_regeneration_unavailable"
+    with factory() as session:
+        versions = session.scalars(
+            select(Digest).where(Digest.window_key == "legacy-window")
+        ).all()
+        assert [digest.id for digest in versions] == [legacy_id]
 
 
 def test_summary_regeneration_requires_key_and_deduplicates(api) -> None:

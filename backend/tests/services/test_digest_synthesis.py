@@ -1,6 +1,8 @@
 import pytest
+from pydantic import ValidationError
 
 from x_digest.ai.contracts import DigestEventOutput, DigestOutput, DigestTopicOutput
+from x_digest.ai.digest_prompt import DIGEST_SYSTEM_INSTRUCTIONS
 from x_digest.services.digest_synthesis import (
     DigestCandidate,
     DigestSource,
@@ -151,3 +153,22 @@ def test_empty_fallback_is_a_complete_empty_digest() -> None:
         topics=[],
         excluded_source_ids=[],
     )
+
+
+def test_digest_prompt_defines_event_boundaries_and_overview_role() -> None:
+    assert "same real-world event" in DIGEST_SYSTEM_INSTRUCTIONS
+    assert "different developments" in DIGEST_SYSTEM_INSTRUCTIONS
+    assert "overview" in DIGEST_SYSTEM_INSTRUCTIONS
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: DigestOutput(overview="   ", topics=[], excluded_source_ids=[]),
+        lambda: DigestTopicOutput(name="   ", events=[event("valid", ["post-a1"])]),
+        lambda: event("   ", ["post-a1"]),
+    ],
+)
+def test_digest_contract_rejects_whitespace_only_copy(factory) -> None:
+    with pytest.raises(ValidationError):
+        factory()
