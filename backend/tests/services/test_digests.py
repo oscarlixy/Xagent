@@ -1,6 +1,7 @@
 import asyncio
 import json
 from datetime import UTC, datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import create_engine, select
@@ -8,7 +9,17 @@ from sqlalchemy.orm import Session
 
 from x_digest.ai.contracts import DigestEventOutput, DigestOutput, DigestTopicOutput
 from x_digest.ai.openai import LLMProviderError
-from x_digest.models import Author, Base, Digest, DigestItem, Post, Summary
+from x_digest.models import (
+    Author,
+    Base,
+    Digest,
+    DigestItem,
+    Post,
+    Summary,
+    Thread,
+    ThreadPost,
+)
+from x_digest.services.digest_candidates import load_digest_candidates
 from x_digest.services.digest_synthesis import DigestProviderResult
 from x_digest.services.digests import (
     DigestWindow,
@@ -500,3 +511,186 @@ def test_generate_digest_never_uses_stale_cross_author_summary() -> None:
         )
 
         assert "Stale cross-author merge" not in json.dumps(digest.rendered_content)
+
+
+def load_reference_digest_fixture(
+    session: Session, fixture_path: Path
+) -> tuple[DigestWindow, tuple[str, ...]]:
+    payload = json.loads(fixture_path.read_text())
+    source_ids = insert_reference_sources(session, payload["source_units"])
+    return reference_window(payload["window"]), tuple(source_ids)
+
+
+def insert_reference_sources(
+    session: Session, source_units: list[dict[str, object]]
+) -> list[str]:
+    usernames = {
+        str(post_payload["username"])
+        for unit in source_units
+        for post_payload in unit["posts"]  # type: ignore[union-attr]
+    }
+    authors = {
+        username: Author(
+            platform_author_id=f"reference-{username}",
+            username=username,
+        )
+        for username in usernames
+    }
+    session.add_all(authors.values())
+    session.flush()
+
+    source_ids: list[str] = []
+    for unit in source_units:
+        post_payloads = unit["posts"]
+        assert isinstance(post_payloads, list)
+        posts = [
+            Post(
+                platform="x",
+                platform_post_id=str(post_payload["id"]),
+                author_id=authors[str(post_payload["username"])].id,
+                text=str(post_payload["text"]),
+                created_at=_reference_datetime(str(post_payload["created_at"])),
+                source_url=(
+                    f"https://x.com/{post_payload['username']}/status/{post_payload['id']}"
+                ),
+                conversation_id=str(unit["id"]),
+            )
+            for post_payload in post_payloads
+        ]
+        session.add_all(posts)
+        session.flush()
+        source_ids.extend(post.id for post in posts)
+        if len(posts) > 1:
+            thread = Thread(
+                conversation_id=str(unit["id"]),
+                author_id=posts[0].author_id,
+                created_at=min(post.created_at for post in posts),
+            )
+            session.add(thread)
+            session.flush()
+            session.add_all(
+                ThreadPost(thread_id=thread.id, post_id=post.id, position=position)
+                for position, post in enumerate(posts)
+            )
+        session.add(
+            Summary(
+                content_fingerprint=f"reference-{unit['id']}",
+                model="fixture-summary-v1",
+                prompt_version="single-content-v1",
+                generation=1,
+                summary=str(unit["summary"]),
+                key_points=[str(unit["category"])],
+                topics=[str(unit["topic"])],
+                importance=int(unit["importance"]),
+                language="en",
+                source_ids=[post.id for post in posts],
+            )
+        )
+    session.flush()
+    return source_ids
+
+
+def reference_window(payload: dict[str, object]) -> DigestWindow:
+    return DigestWindow(
+        start=_reference_datetime(str(payload["start"])),
+        end=_reference_datetime(str(payload["end"])),
+        cadence=str(payload["cadence"]),  # type: ignore[arg-type]
+        timezone=str(payload["timezone"]),
+    )
+
+
+def _reference_datetime(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def test_reference_digest_preserves_five_event_boundaries_and_exclusions() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    fixture_path = Path(__file__).parents[1] / "fixtures" / "reference_digest_candidates.json"
+    payload = json.loads(fixture_path.read_text())
+
+    with Session(engine) as session:
+        window, source_ids = load_reference_digest_fixture(session, fixture_path)
+        candidates = load_digest_candidates(session, window)
+        by_title = {candidate.summary: candidate for candidate in candidates}
+        expected_events = payload["expected_events"]
+        excluded_titles = {
+            unit["summary"]
+            for unit in payload["source_units"]
+            if unit["classification"] == "excluded"
+        }
+        output = DigestOutput(
+            overview="五个事件覆盖模型、Agent、工具、研究与自动驾驶。",
+            topics=[
+                DigestTopicOutput(
+                    name="Agent 与模型",
+                    events=[
+                        DigestEventOutput(
+                            title=title,
+                            what_happened=f"{title} 有了新的公开进展。",
+                            why_it_matters="该进展改变了后续评估或使用方式。",
+                            event_type="analysis",
+                            importance=by_title[title].importance,
+                            source_ids=list(by_title[title].source_ids),
+                        )
+                        for title in expected_events[:2]
+                    ],
+                ),
+                DigestTopicOutput(
+                    name="工具与研究",
+                    events=[
+                        DigestEventOutput(
+                            title=title,
+                            what_happened=f"{title} 有了新的公开进展。",
+                            why_it_matters="该进展提供了可验证的新信息。",
+                            event_type="news",
+                            importance=by_title[title].importance,
+                            source_ids=list(by_title[title].source_ids),
+                        )
+                        for title in expected_events[2:]
+                    ],
+                ),
+            ],
+            excluded_source_ids=[
+                source_id
+                for title in excluded_titles
+                for source_id in by_title[title].source_ids
+            ],
+        )
+
+        digest, _ = asyncio.run(
+            generate_digest(
+                session,
+                synthesizer=FakeDigestSynthesizer(output),
+                window=window,
+            )
+        )
+        items = session.scalars(
+            select(DigestItem)
+            .where(DigestItem.digest_id == digest.id)
+            .order_by(DigestItem.position)
+        ).all()
+        assigned_ids = [
+            source_id
+            for item in items
+            for source_id in item.snapshot_json["source_ids"]
+        ] + digest.rendered_content["excluded_source_ids"]
+        promotional_ids = set(
+            session.scalars(
+                select(Post.id).where(
+                    Post.platform_post_id.in_(("ref-14", "ref-15", "ref-16"))
+                )
+            ).all()
+        )
+
+        assert [item.snapshot_json["title"] for item in items] == expected_events
+        assert len(items) == 5
+        assert len(digest.rendered_content["topics"]) == 2
+        assert set(digest.rendered_content["excluded_source_ids"]) == promotional_ids
+        assert {
+            unit["category"]
+            for unit in payload["source_units"]
+            if unit["classification"] == "excluded"
+        } == set(payload["expected_excluded_categories"])
+        assert sorted(assigned_ids) == sorted(source_ids)
+        assert len(assigned_ids) == len(set(assigned_ids)) == 16

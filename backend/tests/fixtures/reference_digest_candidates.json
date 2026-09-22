@@ -1,0 +1,107 @@
+{
+  "window": {
+    "start": "2026-09-20T00:00:00Z",
+    "end": "2026-09-21T00:00:00Z",
+    "cadence": "daily",
+    "timezone": "UTC"
+  },
+  "expected_events": [
+    "Decision Model",
+    "Agent language drift",
+    "DocJev",
+    "AI social-science research",
+    "Waymo safety revision"
+  ],
+  "expected_excluded_categories": [
+    "conference promotion",
+    "podcast preview"
+  ],
+  "source_units": [
+    {
+      "id": "decision-model-thread",
+      "summary": "Decision Model",
+      "classification": "event",
+      "category": "model research",
+      "topic": "Agent 与模型",
+      "importance": 5,
+      "posts": [
+        {"id": "ref-01", "username": "model_lab", "text": "We introduce a model that separates deliberation from final decisions.", "created_at": "2026-09-20T01:00:00Z"},
+        {"id": "ref-02", "username": "model_lab", "text": "The evaluation compares decision quality under fixed compute.", "created_at": "2026-09-20T01:05:00Z"},
+        {"id": "ref-03", "username": "model_lab", "text": "Results and limitations are included in the technical report.", "created_at": "2026-09-20T01:10:00Z"}
+      ]
+    },
+    {
+      "id": "agent-language-drift-thread",
+      "summary": "Agent language drift",
+      "classification": "event",
+      "category": "agent evaluation",
+      "topic": "Agent 与模型",
+      "importance": 5,
+      "posts": [
+        {"id": "ref-04", "username": "agent_eval", "text": "Long-running agents sometimes lose linguistic precision late in a task.", "created_at": "2026-09-20T03:00:00Z"},
+        {"id": "ref-05", "username": "agent_eval", "text": "The drift appears after many tool calls rather than at initialization.", "created_at": "2026-09-20T03:05:00Z"},
+        {"id": "ref-06", "username": "agent_eval", "text": "Short benchmarks do not expose the same failure mode.", "created_at": "2026-09-20T03:10:00Z"},
+        {"id": "ref-07", "username": "agent_eval", "text": "Tail-quality checks are proposed for long-horizon evaluations.", "created_at": "2026-09-20T03:15:00Z"}
+      ]
+    },
+    {
+      "id": "docjev-thread",
+      "summary": "DocJev",
+      "classification": "event",
+      "category": "developer tool",
+      "topic": "工具与研究",
+      "importance": 4,
+      "posts": [
+        {"id": "ref-08", "username": "tool_builder", "text": "DocJev now traces document changes across agent steps.", "created_at": "2026-09-20T06:00:00Z"},
+        {"id": "ref-09", "username": "tool_builder", "text": "The beta includes reproducible change logs and source pointers.", "created_at": "2026-09-20T06:05:00Z"}
+      ]
+    },
+    {
+      "id": "social-science-thread",
+      "summary": "AI social-science research",
+      "classification": "event",
+      "category": "research",
+      "topic": "工具与研究",
+      "importance": 4,
+      "posts": [
+        {"id": "ref-10", "username": "social_ai", "text": "A preregistered study tests how people delegate judgment to AI systems.", "created_at": "2026-09-20T09:00:00Z"},
+        {"id": "ref-11", "username": "social_ai", "text": "The authors publish methods, uncertainty, and replication materials.", "created_at": "2026-09-20T09:05:00Z"}
+      ]
+    },
+    {
+      "id": "waymo-safety-thread",
+      "summary": "Waymo safety revision",
+      "classification": "event",
+      "category": "safety update",
+      "topic": "工具与研究",
+      "importance": 5,
+      "posts": [
+        {"id": "ref-12", "username": "mobility_watch", "text": "Waymo revised a previously published safety comparison.", "created_at": "2026-09-20T12:00:00Z"},
+        {"id": "ref-13", "username": "mobility_watch", "text": "The revision narrows the claim and explains the corrected denominator.", "created_at": "2026-09-20T12:05:00Z"}
+      ]
+    },
+    {
+      "id": "conference-promotion",
+      "summary": "Conference registration promotion",
+      "classification": "excluded",
+      "category": "conference promotion",
+      "topic": "Promotion",
+      "importance": 1,
+      "posts": [
+        {"id": "ref-14", "username": "event_marketing", "text": "Register today for a discounted conference ticket.", "created_at": "2026-09-20T15:00:00Z"}
+      ]
+    },
+    {
+      "id": "podcast-preview-thread",
+      "summary": "Podcast preview without new information",
+      "classification": "excluded",
+      "category": "podcast preview",
+      "topic": "Promotion",
+      "importance": 1,
+      "posts": [
+        {"id": "ref-15", "username": "podcast_host", "text": "A new episode is coming tomorrow; tune in for the full conversation.", "created_at": "2026-09-20T18:00:00Z"},
+        {"id": "ref-16", "username": "podcast_host", "text": "Preview clip: our guest says the future will be interesting.", "created_at": "2026-09-20T18:05:00Z"}
+      ]
+    }
+  ]
+}
