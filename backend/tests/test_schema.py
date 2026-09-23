@@ -13,6 +13,8 @@ from x_digest.models import (
     Post,
     PostListMembership,
     Summary,
+    SyncRejection,
+    SyncRun,
     XList,
 )
 
@@ -110,3 +112,20 @@ def test_delivery_can_be_claimed_once_per_digest_and_channel(session: Session) -
     session.add(NotificationDelivery(digest_id=digest.id, channel="telegram", status="pending"))
     with pytest.raises(IntegrityError):
         session.commit()
+
+
+def test_sync_rejection_belongs_to_a_run(session: Session) -> None:
+    x_list = XList(platform_list_id="list-a", name="AI")
+    session.add(x_list)
+    session.flush()
+    run = SyncRun(list_id=x_list.id, status="partial")
+    rejection = SyncRejection(
+        sync_run=run,
+        item_identifier="post-42",
+        reason="invalid_item",
+    )
+    session.add_all([run, rejection])
+    session.commit()
+
+    assert rejection.sync_run_id == run.id
+    assert run.rejections == [rejection]

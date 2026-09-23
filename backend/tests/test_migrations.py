@@ -17,8 +17,18 @@ def test_initial_migration_creates_core_tables(
 
     command.upgrade(config, "head")
 
-    tables = inspect(create_engine(f"sqlite+pysqlite:///{database_path}")).get_table_names()
+    inspector = inspect(create_engine(f"sqlite+pysqlite:///{database_path}"))
+    tables = inspector.get_table_names()
     assert {"x_lists", "posts", "summaries", "digests", "sync_runs"}.issubset(tables)
+    assert "sync_rejections" in tables
+    assert {column["name"] for column in inspector.get_columns("x_lists")} >= {
+        "latest_observed_post_id"
+    }
+    assert {column["name"] for column in inspector.get_columns("sync_runs")} >= {
+        "posts_returned",
+        "truncated",
+        "stop_reason",
+    }
 
 
 def test_migration_prefers_database_url_environment(

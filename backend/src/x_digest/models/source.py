@@ -29,6 +29,7 @@ class XList(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     latest_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     latest_seen_post_id: Mapped[str | None] = mapped_column(String(32))
+    latest_observed_post_id: Mapped[str | None] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=datetime.now, onupdate=datetime.now

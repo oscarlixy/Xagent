@@ -24,6 +24,7 @@ from x_digest.models import (
     PostListMembership,
     PostState,
     Summary,
+    SyncRejection,
     SyncRun,
     XList,
 )
@@ -123,6 +124,7 @@ def api() -> tuple[TestClient, sessionmaker[Session], dict[str, str]]:
         )
         session.add_all([older, tied_a, tied_b])
         session.flush()
+        sync_run = SyncRun(list_id=ai_list.id, status="succeeded")
         session.add_all(
             [
                 PostListMembership(post_id=older.id, list_id=ai_list.id),
@@ -153,8 +155,16 @@ def api() -> tuple[TestClient, sessionmaker[Session], dict[str, str]]:
                     language="en",
                     source_ids=[tied_b.id],
                 ),
-                SyncRun(list_id=ai_list.id, status="succeeded"),
+                sync_run,
             ]
+        )
+        session.flush()
+        session.add(
+            SyncRejection(
+                sync_run_id=sync_run.id,
+                item_identifier="rejected-post",
+                reason="provider_rejected",
+            )
         )
         digest_window = {
             "timezone": "UTC",
@@ -263,6 +273,7 @@ def test_list_crud_validates_input_and_missing_resources(api) -> None:
         assert session.scalars(
             select(SyncRun).where(SyncRun.list_id == ids["list"])
         ).all() == []
+        assert session.scalars(select(SyncRejection)).all() == []
 
 
 def test_request_models_reject_type_coercion(api) -> None:
