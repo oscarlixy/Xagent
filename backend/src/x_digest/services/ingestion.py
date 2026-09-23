@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal
@@ -7,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from x_digest.models import SyncRun, XList
-from x_digest.repositories.jobs import advance_list_watermark, begin_sync_run, finish_sync_run
+from x_digest.repositories.jobs import advance_list_cursors, begin_sync_run, finish_sync_run
 from x_digest.repositories.posts import AuthorInput, PostInput, attach_to_list, upsert_post
 from x_digest.services.oauth_client import OAuthClientError
 from x_digest.sources.base import XSource
@@ -35,6 +36,15 @@ _GENERIC_FAILURE_CODE = "ingestion_failed"
 STALE_RUNNING_RUN_THRESHOLD = timedelta(hours=1)
 MAX_STALE_RUNS_PER_RECONCILIATION = 100
 
+StopReason = Literal[
+    "unchanged",
+    "watermark_reached",
+    "time_window_reached",
+    "provider_exhausted",
+    "budget_exhausted",
+]
+Clock = Callable[[], datetime]
+
 
 @dataclass(frozen=True)
 class SyncResult:
@@ -45,6 +55,9 @@ class SyncResult:
     posts_created: int
     duplicates: int
     rejected: int
+    posts_returned: int
+    truncated: bool
+    stop_reason: StopReason
 
 
 class IngestionService:
@@ -53,17 +66,31 @@ class IngestionService:
         *,
         session_factory: sessionmaker[Session],
         source: XSource,
-        max_pages: int = 5,
-        max_posts: int = 500,
+        max_pages: int = 6,
+        max_posts: int = 50,
+        page_size: int = 10,
         overlap: timedelta = timedelta(minutes=10),
+        backfill_window: timedelta = timedelta(hours=24),
+        clock: Clock | None = None,
     ) -> None:
+        if max_pages <= 0:
+            raise ValueError("max_pages must be positive")
+        if max_posts <= 0:
+            raise ValueError("max_posts must be positive")
+        if not 1 <= page_size <= 100:
+            raise ValueError("page_size must be between 1 and 100")
         if overlap < timedelta(0):
             raise ValueError("overlap must not be negative")
+        if backfill_window <= timedelta(0):
+            raise ValueError("backfill_window must be positive")
         self._session_factory = session_factory
         self._source = source
         self._max_pages = max_pages
         self._max_posts = max_posts
+        self._page_size = page_size
         self._overlap = overlap
+        self._backfill_window = backfill_window
+        self._clock = clock or (lambda: datetime.now(UTC))
 
     async def sync_list(self, list_id: str) -> SyncResult:
         with self._session_factory() as session:
@@ -71,11 +98,21 @@ class IngestionService:
             if x_list is None:
                 raise ValueError(f"Unknown List: {list_id}")
             platform_list_id = x_list.platform_list_id
+            stored_head = x_list.latest_observed_post_id
+            initialized = stored_head is not None
+            run_now = _as_utc(self._clock())
+            recovery_cutoff = run_now - self._backfill_window
             watermark_cutoff = (
                 _as_utc(x_list.latest_seen_at) - self._overlap
                 if x_list.latest_seen_at is not None
                 else None
             )
+            if watermark_cutoff is not None and watermark_cutoff >= recovery_cutoff:
+                effective_cutoff = watermark_cutoff
+                cutoff_reason: StopReason = "watermark_reached"
+            else:
+                effective_cutoff = recovery_cutoff
+                cutoff_reason = "time_window_reached"
 
         self._reconcile_stale_runs(list_id)
         with self._session_factory.begin() as session:
@@ -85,36 +122,68 @@ class IngestionService:
         result = _MutableSyncResult(run_id=run_id)
         pagination_token: str | None = None
         try:
-            while result.pages_fetched < self._max_pages and result.posts_seen < self._max_posts:
+            while (
+                result.pages_fetched < self._max_pages
+                and result.posts_returned < self._max_posts
+            ):
+                first_page = result.pages_fetched == 0
+                first_request_size = 1 if initialized else self._page_size
+                request_size = min(
+                    first_request_size if first_page else self._page_size,
+                    self._max_posts - result.posts_returned,
+                )
                 page = await self._source.fetch_page(
                     list_id=platform_list_id,
                     pagination_token=pagination_token,
-                    max_results=min(100, self._max_posts - result.posts_seen),
+                    max_results=request_size,
+                )
+                returned_count = (
+                    page.returned_count
+                    if page.returned_count is not None
+                    else len(page.posts) + len(page.rejected_items)
+                )
+                if returned_count < 0:
+                    raise ValueError("Source returned a negative item count")
+                crossed_effective_cutoff = any(
+                    _as_utc(post.created_at) < effective_cutoff for post in page.posts
                 )
                 with self._session_factory.begin() as session:
                     x_list = session.get(XList, list_id)
                     if x_list is None:  # pragma: no cover - list deletion is externally coordinated
                         raise ValueError(f"Unknown List: {list_id}")
-                    page_result = _MutableSyncResult(run_id=run_id, pages_fetched=1)
+                    page_result = _MutableSyncResult(
+                        run_id=run_id,
+                        pages_fetched=1,
+                        posts_returned=returned_count,
+                        latest_observed_post_id=page.head_post_id if first_page else None,
+                    )
                     page_result.rejected = len(page.rejected_items)
                     if page_result.rejected:
                         page_result.status = "partial"
                     for raw_post in page.posts:
-                        if result.posts_seen + page_result.posts_seen >= self._max_posts:
-                            break
-                        self._store_post(session, x_list, raw_post, page_result)
+                        if _as_utc(raw_post.created_at) >= effective_cutoff:
+                            self._store_post(session, x_list, raw_post, page_result)
                     candidate = _merge_results(result, page_result)
                     durable_run = session.get(SyncRun, run_id)
                     if durable_run is not None:  # pragma: no branch - the run was just created
                         self._record_counts(durable_run, candidate)
                 result = candidate
-                if watermark_cutoff is not None and page.posts and all(
-                    _as_utc(post.created_at) < watermark_cutoff for post in page.posts
+                if first_page and initialized and page.head_post_id == stored_head:
+                    result.stop_reason = "unchanged"
+                elif crossed_effective_cutoff:
+                    result.stop_reason = cutoff_reason
+                elif page.next_token is None or returned_count == 0:
+                    result.stop_reason = "provider_exhausted"
+                elif (
+                    result.posts_returned >= self._max_posts
+                    or result.pages_fetched >= self._max_pages
                 ):
-                    break
-                if page.next_token is None:
-                    break
-                pagination_token = page.next_token
+                    result.stop_reason = "budget_exhausted"
+                    result.truncated = True
+                else:
+                    pagination_token = page.next_token
+                    continue
+                break
         except asyncio.CancelledError:
             self._best_effort_finish_failed(result, error_code=_GENERIC_FAILURE_CODE)
             raise
@@ -137,15 +206,17 @@ class IngestionService:
             durable_run = session.get(SyncRun, result.run_id)
             if x_list is None or durable_run is None:
                 raise ValueError(f"Unknown List: {list_id}")
+            if result.stop_reason is None:
+                raise ValueError("Sync run completed without a stop reason")
             finish_sync_run(session, sync_run=durable_run, status=result.status)
-            if result.status == "succeeded" and result.latest_seen_at is not None:
-                advance_list_watermark(
-                    session,
-                    x_list=x_list,
-                    sync_run=durable_run,
-                    latest_seen_at=result.latest_seen_at,
-                    latest_seen_post_id=result.latest_seen_post_id or "",
-                )
+            advance_list_cursors(
+                session,
+                x_list=x_list,
+                sync_run=durable_run,
+                latest_observed_post_id=result.latest_observed_post_id,
+                latest_seen_at=result.latest_seen_at,
+                latest_seen_post_id=result.latest_seen_post_id,
+            )
             self._record_counts(durable_run, result)
             return SyncResult(
                 run_id=result.run_id,
@@ -155,6 +226,9 @@ class IngestionService:
                 posts_created=result.posts_created,
                 duplicates=result.duplicates,
                 rejected=result.rejected,
+                posts_returned=result.posts_returned,
+                truncated=result.truncated,
+                stop_reason=result.stop_reason,
             )
 
     def _reconcile_stale_runs(self, list_id: str) -> None:
@@ -197,6 +271,9 @@ class IngestionService:
         sync_run.posts_created = result.posts_created
         sync_run.duplicates = result.duplicates
         sync_run.rejected = result.rejected
+        sync_run.posts_returned = result.posts_returned
+        sync_run.truncated = result.truncated
+        sync_run.stop_reason = result.stop_reason
 
     @staticmethod
     def _store_post(
@@ -244,6 +321,10 @@ class _MutableSyncResult:
     posts_created: int = 0
     duplicates: int = 0
     rejected: int = 0
+    posts_returned: int = 0
+    truncated: bool = False
+    stop_reason: StopReason | None = None
+    latest_observed_post_id: str | None = None
     latest_seen_at: datetime | None = None
     latest_seen_post_id: str | None = None
 
@@ -266,6 +347,12 @@ def _merge_results(result: _MutableSyncResult, page: _MutableSyncResult) -> _Mut
         posts_created=result.posts_created + page.posts_created,
         duplicates=result.duplicates + page.duplicates,
         rejected=result.rejected + page.rejected,
+        posts_returned=result.posts_returned + page.posts_returned,
+        truncated=result.truncated or page.truncated,
+        stop_reason=page.stop_reason or result.stop_reason,
+        latest_observed_post_id=(
+            page.latest_observed_post_id or result.latest_observed_post_id
+        ),
         latest_seen_at=latest_seen_at,
         latest_seen_post_id=latest_seen_post_id,
     )

@@ -169,7 +169,7 @@ def test_fetched_link_body_is_persisted_and_included_in_summary_input() -> None:
     )
 
 
-def test_provider_rejections_remain_partial_through_pipeline_and_withhold_watermark() -> None:
+def test_provider_rejections_remain_partial_through_pipeline_and_advance_safe_watermark() -> None:
     session_factory, list_id, service = make_pipeline(
         posts=(raw_post("101"),),
         rejected_items=(RejectedItem(identifier="102", reason="provider_rejected"),),
@@ -194,8 +194,8 @@ def test_provider_rejections_remain_partial_through_pipeline_and_withhold_waterm
         assert run.status == "partial"
         assert run.rejected == 1
         assert run.error_code == "ingestion_partial"
-        assert x_list.latest_seen_at is None
-        assert x_list.latest_seen_post_id is None
+        assert x_list.latest_seen_at is not None
+        assert x_list.latest_seen_post_id == "101"
         snapshot = status_snapshot(session)
         assert snapshot["latest_run"]["stages"]["ingestion"]["last_error"] == (
             "ingestion_partial"

@@ -51,26 +51,6 @@ def advance_list_cursors(
     return observed_advanced, watermark_advanced
 
 
-def advance_list_watermark(
-    session: Session,
-    *,
-    x_list: XList,
-    sync_run: SyncRun,
-    latest_seen_at: datetime,
-    latest_seen_post_id: str,
-) -> bool:
-    """Compatibility wrapper until the ingestion service adopts both cursors."""
-    _, watermark_advanced = advance_list_cursors(
-        session,
-        x_list=x_list,
-        sync_run=sync_run,
-        latest_observed_post_id=None,
-        latest_seen_at=latest_seen_at,
-        latest_seen_post_id=latest_seen_post_id,
-    )
-    return watermark_advanced
-
-
 def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)

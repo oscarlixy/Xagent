@@ -3,7 +3,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import create_engine, delete, event, select
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from x_digest.models import Base, Post, PostListMembership, SyncRun, XList
 from x_digest.repositories.lists import upsert_list
@@ -12,6 +12,205 @@ from x_digest.services.oauth_client import OAuthClientError
 from x_digest.sources.errors import AuthenticationError, RateLimitError, UpstreamError
 from x_digest.sources.fake import FakeXSource
 from x_digest.sources.types import RawAuthor, RawPost, RejectedItem, SourcePage
+
+NOW = datetime(2026, 9, 23, 12, tzinfo=UTC)
+
+
+def _page(
+    *posts: RawPost,
+    next_token: str | None = None,
+    rejected_items: tuple[RejectedItem, ...] = (),
+    returned_count: int | None = None,
+    head_post_id: str | None = None,
+) -> SourcePage:
+    return SourcePage(
+        posts=posts,
+        rejected_items=rejected_items,
+        next_token=next_token,
+        returned_count=(
+            len(posts) + len(rejected_items) if returned_count is None else returned_count
+        ),
+        head_post_id=head_post_id or (posts[0].id if posts else None),
+    )
+
+
+def _new_list(
+    *,
+    observed_head: str | None = None,
+    latest_seen_at: datetime | None = None,
+) -> tuple[sessionmaker[Session], str]:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(engine)
+    with factory.begin() as session:
+        x_list = upsert_list(session, platform_list_id="123456789", name="AI news")
+        x_list.latest_observed_post_id = observed_head
+        x_list.latest_seen_at = latest_seen_at
+        x_list.latest_seen_post_id = "stored-watermark" if latest_seen_at else None
+        list_id = x_list.id
+    return factory, list_id
+
+
+def _service(
+    factory: sessionmaker[Session],
+    source: FakeXSource,
+    *,
+    max_pages: int = 6,
+    max_posts: int = 50,
+    page_size: int = 10,
+) -> IngestionService:
+    return IngestionService(
+        session_factory=factory,
+        source=source,
+        max_pages=max_pages,
+        max_posts=max_posts,
+        page_size=page_size,
+        overlap=timedelta(minutes=10),
+        backfill_window=timedelta(hours=24),
+        clock=lambda: NOW,
+    )
+
+
+def _stored_platform_ids(factory: sessionmaker[Session]) -> set[str]:
+    with factory() as session:
+        return {post.platform_post_id for post in session.scalars(select(Post))}
+
+
+def test_initialized_unchanged_list_stops_after_one_result_probe() -> None:
+    factory, list_id = _new_list(
+        observed_head="head", latest_seen_at=NOW - timedelta(hours=1)
+    )
+    source = FakeXSource({None: _page(_raw_post("head", NOW), head_post_id="head")})
+    result = asyncio.run(_service(factory, source).sync_list(list_id))
+
+    assert [call[2] for call in source.calls] == [1]
+    assert result.posts_returned == 1
+    assert result.stop_reason == "unchanged"
+    assert result.truncated is False
+
+
+def test_uninitialized_list_starts_with_ten_results_and_skips_old_posts() -> None:
+    factory, list_id = _new_list()
+    source = FakeXSource(
+        {
+            None: _page(
+                _raw_post("new", NOW - timedelta(hours=1)),
+                _raw_post("old", NOW - timedelta(hours=25)),
+                head_post_id="new",
+            )
+        }
+    )
+    result = asyncio.run(_service(factory, source).sync_list(list_id))
+
+    assert [call[2] for call in source.calls] == [10]
+    assert result.stop_reason == "time_window_reached"
+    assert _stored_platform_ids(factory) == {"new"}
+
+
+def test_incremental_thirty_posts_returns_at_most_forty_one_items() -> None:
+    factory, list_id = _new_list(
+        observed_head="old-head", latest_seen_at=NOW - timedelta(hours=2)
+    )
+    new_posts = tuple(
+        _raw_post(f"new-{index:02d}", NOW - timedelta(minutes=index))
+        for index in range(30)
+    )
+    old = _raw_post("old", NOW - timedelta(hours=3))
+    source = FakeXSource(
+        {
+            None: _page(new_posts[0], next_token="p1", returned_count=1),
+            "p1": _page(*new_posts[1:11], next_token="p2", returned_count=10),
+            "p2": _page(*new_posts[11:21], next_token="p3", returned_count=10),
+            "p3": _page(*new_posts[21:30], old, next_token="p4", returned_count=10),
+        }
+    )
+    result = asyncio.run(_service(factory, source).sync_list(list_id))
+
+    assert [call[2] for call in source.calls] == [1, 10, 10, 10]
+    assert result.posts_returned == 31
+    assert result.posts_returned <= 41
+    assert result.truncated is False
+    assert result.stop_reason == "watermark_reached"
+
+
+def test_remaining_budget_reduces_requested_page_size() -> None:
+    factory, list_id = _new_list()
+    source = FakeXSource(
+        {None: _page(_raw_post("head", NOW), next_token="p2", returned_count=7)}
+    )
+    service = _service(factory, source, max_posts=7, page_size=10)
+    asyncio.run(service.sync_list(list_id))
+
+    assert [call[2] for call in source.calls] == [7]
+
+
+def test_mixed_page_crossing_recent_watermark_does_not_fetch_next_page() -> None:
+    factory, list_id = _new_list(latest_seen_at=NOW - timedelta(minutes=30))
+    source = FakeXSource(
+        {
+            None: _page(
+                _raw_post("new", NOW),
+                _raw_post("old", NOW - timedelta(minutes=41)),
+                next_token="p2",
+            ),
+            "p2": _page(_raw_post("must-not-fetch", NOW - timedelta(hours=1))),
+        }
+    )
+    result = asyncio.run(_service(factory, source).sync_list(list_id))
+
+    assert [call[1] for call in source.calls] == [None]
+    assert result.stop_reason == "watermark_reached"
+
+
+def test_naive_watermark_is_normalized_against_aware_clock() -> None:
+    factory, list_id = _new_list(
+        latest_seen_at=(NOW - timedelta(minutes=30)).replace(tzinfo=None)
+    )
+    source = FakeXSource({None: _page(_raw_post("old", NOW - timedelta(minutes=41)))})
+    result = asyncio.run(_service(factory, source).sync_list(list_id))
+
+    assert result.stop_reason == "watermark_reached"
+
+
+def test_repeated_pagination_token_stops_at_page_limit_as_truncated() -> None:
+    factory, list_id = _new_list()
+    source = FakeXSource(
+        {
+            None: _page(_raw_post("head", NOW), next_token="repeat"),
+            "repeat": _page(_raw_post("again", NOW), next_token="repeat"),
+        }
+    )
+    result = asyncio.run(_service(factory, source, max_pages=3).sync_list(list_id))
+
+    assert result.pages_fetched == 3
+    assert result.truncated is True
+    assert result.stop_reason == "budget_exhausted"
+
+
+def test_rejected_only_pages_with_next_tokens_are_bounded() -> None:
+    factory, list_id = _new_list()
+    rejected = (RejectedItem(identifier="bad", reason="invalid_item"),)
+    source = FakeXSource(
+        {
+            None: _page(rejected_items=rejected, next_token="p2", returned_count=1),
+            "p2": _page(rejected_items=rejected, next_token="p3", returned_count=1),
+            "p3": _page(rejected_items=rejected, next_token="p4", returned_count=1),
+        }
+    )
+    result = asyncio.run(_service(factory, source, max_pages=3).sync_list(list_id))
+
+    assert result.pages_fetched == 3
+    assert result.truncated is True
+
+
+def test_empty_page_with_next_token_stops_as_provider_exhausted() -> None:
+    factory, list_id = _new_list()
+    source = FakeXSource({None: _page(next_token="p2", returned_count=0)})
+    result = asyncio.run(_service(factory, source).sync_list(list_id))
+
+    assert len(source.calls) == 1
+    assert result.stop_reason == "provider_exhausted"
+    assert result.truncated is False
 
 
 def test_fake_source_sync_is_idempotent_and_advances_watermark() -> None:
@@ -59,7 +258,7 @@ def test_fake_source_sync_is_idempotent_and_advances_watermark() -> None:
         assert len(session.scalars(select(Post)).all()) == 2
 
 
-def test_sync_stops_after_a_whole_page_is_older_than_watermark_overlap() -> None:
+def test_sync_stops_when_any_valid_post_crosses_watermark_overlap() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(engine)
@@ -94,10 +293,7 @@ def test_sync_stops_after_a_whole_page_is_older_than_watermark_overlap() -> None
     assert result.pages_fetched == 2
     assert [call[1] for call in source.calls] == [None, "p2"]
     with session_factory() as session:
-        assert {post.platform_post_id for post in session.scalars(select(Post))} == {
-            "new",
-            "overlap",
-        }
+        assert {post.platform_post_id for post in session.scalars(select(Post))} == {"new"}
 
 
 def test_rejected_only_page_does_not_trigger_watermark_stop() -> None:
@@ -333,7 +529,7 @@ def test_rolled_back_page_does_not_inflate_durable_run_counts() -> None:
         assert session.scalars(select(Post)).all() == []
 
 
-def test_rejected_page_is_partial_and_does_not_advance_the_watermark() -> None:
+def test_rejected_page_is_partial_and_advances_safe_watermark() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(engine)
@@ -372,7 +568,7 @@ def test_rejected_page_is_partial_and_does_not_advance_the_watermark() -> None:
         assert result.rejected == 1
         assert run.status == "partial"
         assert run.rejected == 1
-        assert x_list.latest_seen_at is None
+        assert x_list.latest_seen_post_id == "101"
 
 
 def test_final_completion_commit_failure_marks_the_durable_run_failed() -> None:
