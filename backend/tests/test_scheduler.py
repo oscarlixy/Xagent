@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from datetime import UTC, datetime, timedelta
@@ -6,6 +7,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from x_digest import scheduler as scheduler_module
 from x_digest.ai.fallback import DeterministicDigestSynthesizer
 from x_digest.config import Settings
 from x_digest.models import Author, Base, Digest, Post, Summary, XList
@@ -43,6 +45,33 @@ def make_services(
         ),
         list_id,
     )
+
+
+def test_scheduler_pipeline_receives_bounded_ingestion_settings(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def capture_ingestion(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(scheduler_module, "IngestionService", capture_ingestion)
+    session_factory = sessionmaker(create_engine("sqlite+pysqlite:///:memory:"))
+    _pipeline, oauth_client, source = scheduler_module.build_production_pipeline(
+        Settings(_env_file=None), session_factory
+    )
+    asyncio.run(source.aclose())
+    asyncio.run(oauth_client.aclose())
+
+    assert {
+        key: captured[key]
+        for key in ("page_size", "max_posts", "max_pages", "overlap", "backfill_window")
+    } == {
+        "page_size": 10,
+        "max_posts": 50,
+        "max_pages": 6,
+        "overlap": timedelta(minutes=10),
+        "backfill_window": timedelta(hours=24),
+    }
 
 
 def test_scheduler_adds_enabled_list_job_with_safe_execution_defaults() -> None:
