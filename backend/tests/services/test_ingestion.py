@@ -5,7 +5,7 @@ import pytest
 from sqlalchemy import create_engine, delete, event, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from x_digest.models import Base, Post, PostListMembership, SyncRun, XList
+from x_digest.models import Base, Post, PostListMembership, SyncRejection, SyncRun, XList
 from x_digest.repositories.lists import upsert_list
 from x_digest.services.ingestion import IngestionService
 from x_digest.services.oauth_client import OAuthClientError
@@ -213,6 +213,36 @@ def test_empty_page_with_next_token_stops_as_provider_exhausted() -> None:
     assert result.truncated is False
 
 
+def test_budget_truncation_advances_head_and_next_run_uses_unchanged_probe() -> None:
+    factory, list_id = _new_list()
+    pages: dict[str | None, SourcePage] = {}
+    for page_index in range(5):
+        token = None if page_index == 0 else f"p{page_index}"
+        next_token = f"p{page_index + 1}"
+        posts = tuple(
+            _raw_post(
+                f"post-{page_index * 10 + offset:02d}",
+                NOW - timedelta(minutes=page_index * 10 + offset),
+            )
+            for offset in range(10)
+        )
+        pages[token] = _page(*posts, next_token=next_token, returned_count=10)
+    source = FakeXSource(pages)
+    first = asyncio.run(_service(factory, source).sync_list(list_id))
+
+    source.pages = {
+        None: _page(
+            _raw_post("post-00", NOW), returned_count=1, head_post_id="post-00"
+        )
+    }
+    second = asyncio.run(_service(factory, source).sync_list(list_id))
+
+    assert first.truncated is True
+    assert first.stop_reason == "budget_exhausted"
+    assert second.stop_reason == "unchanged"
+    assert second.posts_returned == 1
+
+
 def test_fake_source_sync_is_idempotent_and_advances_watermark() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -395,7 +425,7 @@ def test_source_fetch_happens_outside_an_active_database_transaction() -> None:
     assert result.pages_fetched == 1
 
 
-def test_cancelled_source_finalizes_the_durable_run_as_failed_without_watermark() -> None:
+def test_cancelled_second_page_retains_rows_but_advances_no_cursors() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(engine)
@@ -404,9 +434,18 @@ def test_cancelled_source_finalizes_the_durable_run_as_failed_without_watermark(
         list_id = x_list.id
 
     class CancelledSource:
+        calls = 0
+
         async def fetch_page(
             self, *, list_id: str, pagination_token: str | None, max_results: int
         ) -> SourcePage:
+            self.calls += 1
+            if self.calls == 1:
+                return _page(
+                    _raw_post("committed", NOW),
+                    next_token="p2",
+                    head_post_id="committed",
+                )
             raise asyncio.CancelledError
 
     with pytest.raises(asyncio.CancelledError):
@@ -424,7 +463,60 @@ def test_cancelled_source_finalizes_the_durable_run_as_failed_without_watermark(
         assert run.status == "failed"
         assert run.finished_at is not None
         assert run.error_code == "ingestion_failed"
+        assert run.posts_created == 1
+        assert run.truncated is False
+        assert run.stop_reason is None
+        assert x_list.latest_observed_post_id is None
         assert x_list.latest_seen_at is None
+        assert x_list.latest_seen_post_id is None
+        assert {post.platform_post_id for post in session.scalars(select(Post))} == {
+            "committed"
+        }
+
+
+def test_second_page_failure_retains_rows_but_advances_no_cursors() -> None:
+    factory, list_id = _new_list()
+
+    class FailingSecondPageSource:
+        calls = 0
+
+        async def fetch_page(
+            self, *, list_id: str, pagination_token: str | None, max_results: int
+        ) -> SourcePage:
+            self.calls += 1
+            if self.calls == 1:
+                return _page(
+                    _raw_post("committed", NOW),
+                    next_token="p2",
+                    head_post_id="committed",
+                )
+            raise UpstreamError()
+
+    with pytest.raises(UpstreamError):
+        asyncio.run(
+            IngestionService(
+                session_factory=factory,
+                source=FailingSecondPageSource(),
+                clock=lambda: NOW,
+            ).sync_list(list_id)
+        )
+
+    with factory() as session:
+        run = session.scalar(select(SyncRun))
+        x_list = session.get(XList, list_id)
+        assert run is not None
+        assert x_list is not None
+        assert run.status == "failed"
+        assert run.posts_created == 1
+        assert run.posts_returned == 1
+        assert run.truncated is False
+        assert run.stop_reason is None
+        assert x_list.latest_observed_post_id is None
+        assert x_list.latest_seen_at is None
+        assert x_list.latest_seen_post_id is None
+        assert {post.platform_post_id for post in session.scalars(select(Post))} == {
+            "committed"
+        }
 
 
 @pytest.mark.parametrize(
@@ -529,45 +621,34 @@ def test_rolled_back_page_does_not_inflate_durable_run_counts() -> None:
         assert session.scalars(select(Post)).all() == []
 
 
-def test_rejected_page_is_partial_and_advances_safe_watermark() -> None:
-    engine = create_engine("sqlite+pysqlite:///:memory:")
-    Base.metadata.create_all(engine)
-    session_factory = sessionmaker(engine)
-    now = datetime.now(UTC)
-    with session_factory.begin() as session:
-        x_list = upsert_list(session, platform_list_id="123456789", name="AI news")
-        list_id = x_list.id
-
+def test_rejected_page_is_partial_records_rejection_and_advances_cursors() -> None:
+    factory, list_id = _new_list()
     source = FakeXSource(
         {
-            None: SourcePage(
-                posts=(
-                    RawPost(
-                        id="101",
-                        author=RawAuthor(id="author-1", username="author"),
-                        text="first post",
-                        created_at=now,
-                        source_url="https://x.com/author/status/101",
-                    ),
-                ),
+            None: _page(
+                _raw_post("101", NOW),
                 rejected_items=(RejectedItem(identifier="102", reason="provider_rejected"),),
+                returned_count=2,
+                head_post_id="101",
             )
         }
     )
+    result = asyncio.run(_service(factory, source).sync_list(list_id))
 
-    result = asyncio.run(
-        IngestionService(session_factory=session_factory, source=source).sync_list(list_id)
-    )
-
-    with session_factory() as session:
+    with factory() as session:
         run = session.scalar(select(SyncRun))
+        rejection = session.scalar(select(SyncRejection))
         x_list = session.get(XList, list_id)
         assert run is not None
+        assert rejection is not None
         assert x_list is not None
         assert result.status == "partial"
         assert result.rejected == 1
-        assert run.status == "partial"
-        assert run.rejected == 1
+        assert (rejection.item_identifier, rejection.reason) == (
+            "102",
+            "provider_rejected",
+        )
+        assert x_list.latest_observed_post_id == "101"
         assert x_list.latest_seen_post_id == "101"
 
 
@@ -609,7 +690,11 @@ def test_final_completion_commit_failure_marks_the_durable_run_failed() -> None:
         assert run.finished_at is not None
         assert run.error_code == "ingestion_failed"
         assert (run.pages_fetched, run.posts_created) == (1, 1)
+        assert run.truncated is False
+        assert run.stop_reason is None
+        assert x_list.latest_observed_post_id is None
         assert x_list.latest_seen_at is None
+        assert x_list.latest_seen_post_id is None
 
 
 def test_missing_list_during_completion_marks_the_durable_run_failed() -> None:

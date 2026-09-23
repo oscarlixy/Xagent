@@ -88,7 +88,16 @@ def make_pipeline(
         list_id = x_list.id
     ingestion = IngestionService(
         session_factory=session_factory,
-        source=FakeXSource({None: SourcePage(posts=posts, rejected_items=rejected_items)}),
+        source=FakeXSource(
+            {
+                None: SourcePage(
+                    posts=posts,
+                    rejected_items=rejected_items,
+                    returned_count=len(posts) + len(rejected_items),
+                    head_post_id=posts[0].id if posts else None,
+                )
+            }
+        ),
     )
     service = PipelineService(
         ingestion=ingestion,
@@ -196,6 +205,7 @@ def test_provider_rejections_remain_partial_through_pipeline_and_advance_safe_wa
         assert run.error_code == "ingestion_partial"
         assert x_list.latest_seen_at is not None
         assert x_list.latest_seen_post_id == "101"
+        assert x_list.latest_observed_post_id == "101"
         snapshot = status_snapshot(session)
         assert snapshot["latest_run"]["stages"]["ingestion"]["last_error"] == (
             "ingestion_partial"

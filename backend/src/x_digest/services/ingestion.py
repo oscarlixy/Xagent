@@ -7,7 +7,7 @@ from typing import Literal
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from x_digest.models import SyncRun, XList
+from x_digest.models import SyncRejection, SyncRun, XList
 from x_digest.repositories.jobs import advance_list_cursors, begin_sync_run, finish_sync_run
 from x_digest.repositories.posts import AuthorInput, PostInput, attach_to_list, upsert_post
 from x_digest.services.oauth_client import OAuthClientError
@@ -166,6 +166,14 @@ class IngestionService:
                     candidate = _merge_results(result, page_result)
                     durable_run = session.get(SyncRun, run_id)
                     if durable_run is not None:  # pragma: no branch - the run was just created
+                        for rejected in page.rejected_items:
+                            session.add(
+                                SyncRejection(
+                                    sync_run_id=run_id,
+                                    item_identifier=rejected.identifier,
+                                    reason=rejected.reason,
+                                )
+                            )
                         self._record_counts(durable_run, candidate)
                 result = candidate
                 if first_page and initialized and page.head_post_id == stored_head:
@@ -263,6 +271,8 @@ class IngestionService:
             finish_sync_run(session, sync_run=sync_run, status="failed")
             sync_run.error_code = error_code
             self._record_counts(sync_run, result)
+            sync_run.truncated = False
+            sync_run.stop_reason = None
 
     @staticmethod
     def _record_counts(sync_run: SyncRun, result: "_MutableSyncResult") -> None:
