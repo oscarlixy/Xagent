@@ -36,3 +36,5 @@ class SourcePage:
     rejected_items: tuple[RejectedItem, ...] = ()
     next_token: str | None = None
     request_id: str | None = None
+    returned_count: int | None = None
+    head_post_id: str | None = None

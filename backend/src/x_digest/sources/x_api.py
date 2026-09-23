@@ -132,6 +132,10 @@ def _parse_page(response: httpx.Response, *, request_id: str | None) -> SourcePa
     data = payload.get("data", [])
     if not isinstance(data, list):
         raise InvalidResponseError(request_id=request_id)
+    returned_count = len(data)
+    first_item = data[0] if data else None
+    raw_head = first_item.get("id") if isinstance(first_item, Mapping) else None
+    head_post_id = raw_head if isinstance(raw_head, str) else None
     users = _users_by_id(payload.get("includes"), request_id=request_id)
     errors = payload.get("errors", [])
     if not isinstance(errors, list):
@@ -170,6 +174,8 @@ def _parse_page(response: httpx.Response, *, request_id: str | None) -> SourcePa
         rejected_items=tuple(rejected),
         next_token=next_token,
         request_id=request_id,
+        returned_count=returned_count,
+        head_post_id=head_post_id,
     )
 
 

@@ -100,10 +100,36 @@ def test_fetch_page_uses_oauth_and_exact_list_query_without_repost_lookups() -> 
     assert requests[0].headers["authorization"] == f"Bearer {SECRET}"
     assert page.next_token == "next-page"
     assert page.request_id == "request-1"
+    assert page.returned_count == 1
+    assert page.head_post_id == "tweet-1"
     assert len(page.posts) == 1
     assert page.posts[0].author.username == "alice"
     assert page.posts[0].references == [{"type": "reposted", "id": "original-1"}]
     assert page.posts[0].source_url == "https://x.com/alice/status/tweet-1"
+
+
+def test_fetch_page_preserves_raw_count_and_head_before_item_rejection() -> None:
+    payload = {
+        "data": [
+            {"id": "bad-head", "text": "missing fields"},
+            _response_payload()["data"][0],  # type: ignore[index]
+        ],
+        "includes": _response_payload()["includes"],
+        "errors": [{"value": "provider-error"}],
+        "meta": {},
+    }
+    source, _tokens, client = _source(lambda _request: httpx.Response(200, json=payload))
+    try:
+        page = asyncio.run(
+            source.fetch_page(list_id=LIST_ID, pagination_token=None, max_results=10)
+        )
+    finally:
+        asyncio.run(client.aclose())
+
+    assert page.returned_count == 2
+    assert page.head_post_id == "bad-head"
+    assert len(page.posts) == 1
+    assert len(page.rejected_items) == 2
 
 
 def test_fetch_page_accepts_legacy_referenced_tweets_during_api_transition() -> None:
