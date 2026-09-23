@@ -40,7 +40,14 @@ class FakePipeline:
         return PipelineResult(
             run_id=f"run-for-{list_id}",
             status="succeeded",
-            stages={"ingestion": StageResult(counts={"posts_created": 0}, duration_ms=1)},
+            stages={
+                "ingestion": StageResult(
+                    counts={"posts_created": 0},
+                    duration_ms=1,
+                    truncated=True,
+                    stop_reason="budget_exhausted",
+                )
+            },
         )
 
 
@@ -638,8 +645,11 @@ def test_sync_job_returns_pipeline_result_and_status_is_safe(api) -> None:
     status = client.get("/api/status", headers=AUTH)
 
     assert result.status_code == 200
+    assert result.json()["status"] == "succeeded"
     assert result.json()["run_id"] == f"run-for-{ids['list']}"
     assert result.json()["stages"]["ingestion"]["counts"] == {"posts_created": 0}
+    assert result.json()["stages"]["ingestion"]["truncated"] is True
+    assert result.json()["stages"]["ingestion"]["stop_reason"] == "budget_exhausted"
     assert status.status_code == 200
     assert set(status.json()) == {
         "latest_run",

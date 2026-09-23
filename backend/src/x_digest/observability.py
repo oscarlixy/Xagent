@@ -10,7 +10,14 @@ from sqlalchemy.orm import Session
 from x_digest.models import NotificationDelivery, Summary, SyncRun, XList
 
 _SAFE_STAGE_COUNTS = {
-    "ingestion": {"pages_fetched", "posts_seen", "posts_created", "duplicates", "rejected"},
+    "ingestion": {
+        "pages_fetched",
+        "posts_seen",
+        "posts_created",
+        "duplicates",
+        "rejected",
+        "posts_returned",
+    },
     "processing": {"processed", "threads_created", "thread_posts_created"},
     "links": {"selected", "processed", "failed"},
     "summary": {"selected", "created", "failed"},
@@ -32,6 +39,13 @@ _SAFE_SYNC_ERROR_CODES = _SAFE_ERROR_CODES | {
     "oauth_authorization_failed",
     "oauth_upstream_unavailable",
     "oauth_token_invalid",
+}
+_SAFE_STOP_REASONS = {
+    "unchanged",
+    "watermark_reached",
+    "time_window_reached",
+    "provider_exhausted",
+    "budget_exhausted",
 }
 _STALE_GRACE = timedelta(minutes=5)
 
@@ -142,10 +156,14 @@ def _run_snapshot(run: SyncRun | None) -> dict[str, Any] | None:
         )
         duration = values.get("duration_ms", 0)
         error_code = values.get("error_code")
+        truncated = values.get("truncated")
+        stop_reason = values.get("stop_reason")
         safe_stages[name] = {
             "counts": safe_counts,
             "duration_ms": duration if isinstance(duration, int) and duration >= 0 else 0,
             "last_error": error_code if error_code in _SAFE_ERROR_CODES else None,
+            "truncated": truncated if isinstance(truncated, bool) else False,
+            "stop_reason": stop_reason if stop_reason in _SAFE_STOP_REASONS else None,
         }
     return {
         "id": run.id,
@@ -153,5 +171,8 @@ def _run_snapshot(run: SyncRun | None) -> dict[str, Any] | None:
         "status": run.status,
         "started_at": run.started_at,
         "finished_at": run.finished_at,
+        "posts_returned": run.posts_returned,
+        "truncated": run.truncated,
+        "stop_reason": run.stop_reason if run.stop_reason in _SAFE_STOP_REASONS else None,
         "stages": safe_stages,
     }

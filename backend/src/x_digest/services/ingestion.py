@@ -144,6 +144,9 @@ class IngestionService:
                 )
                 if returned_count < 0:
                     raise ValueError("Source returned a negative item count")
+                # Provider reads are incurred before the page transaction commits, so retain
+                # this accounting even if persistence fails and the run becomes failed.
+                result.posts_returned += returned_count
                 crossed_effective_cutoff = any(
                     _as_utc(post.created_at) < effective_cutoff for post in page.posts
                 )
@@ -154,7 +157,6 @@ class IngestionService:
                     page_result = _MutableSyncResult(
                         run_id=run_id,
                         pages_fetched=1,
-                        posts_returned=returned_count,
                         latest_observed_post_id=page.head_post_id if first_page else None,
                     )
                     page_result.rejected = len(page.rejected_items)

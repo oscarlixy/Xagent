@@ -21,6 +21,7 @@ from x_digest.sources.types import RawAuthor, RawPost, RejectedItem, SourcePage
 DEFAULT_X_API_BASE_URL = "https://api.x.com/2"
 MAX_RETRY_DELAY_SECONDS = 60.0
 LIST_ID_PATTERN = re.compile(r"^[0-9]{1,19}$")
+SAFE_PROVIDER_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 type Sleeper = Callable[[float], Awaitable[None]]
 
@@ -121,6 +122,12 @@ def is_valid_x_list_id(value: str) -> bool:
     return LIST_ID_PATTERN.fullmatch(value) is not None
 
 
+def _safe_identifier(value: object, *, max_length: int) -> str | None:
+    if not isinstance(value, str) or not 1 <= len(value) <= max_length:
+        return None
+    return value if SAFE_PROVIDER_IDENTIFIER_PATTERN.fullmatch(value) is not None else None
+
+
 def _parse_page(response: httpx.Response, *, request_id: str | None) -> SourcePage:
     try:
         payload = response.json()
@@ -135,7 +142,7 @@ def _parse_page(response: httpx.Response, *, request_id: str | None) -> SourcePa
     returned_count = len(data)
     first_item = data[0] if data else None
     raw_head = first_item.get("id") if isinstance(first_item, Mapping) else None
-    head_post_id = raw_head if isinstance(raw_head, str) else None
+    head_post_id = _safe_identifier(raw_head, max_length=32)
     users = _users_by_id(payload.get("includes"), request_id=request_id)
     errors = payload.get("errors", [])
     if not isinstance(errors, list):
@@ -155,7 +162,7 @@ def _parse_page(response: httpx.Response, *, request_id: str | None) -> SourcePa
             identifier = item.get("id") if isinstance(item, Mapping) else None
             rejected.append(
                 RejectedItem(
-                    identifier=identifier if isinstance(identifier, str) else None,
+                    identifier=_safe_identifier(identifier, max_length=64),
                     reason="invalid_item",
                 )
             )
@@ -165,7 +172,7 @@ def _parse_page(response: httpx.Response, *, request_id: str | None) -> SourcePa
         identifier = error.get("value") if isinstance(error, Mapping) else None
         rejected.append(
             RejectedItem(
-                identifier=identifier if isinstance(identifier, str) else None,
+                identifier=_safe_identifier(identifier, max_length=64),
                 reason="provider_rejected",
             )
         )
@@ -206,7 +213,7 @@ def _users_by_id(includes: object, *, request_id: str | None) -> dict[str, RawAu
 def _parse_post(item: object, users: Mapping[str, RawAuthor]) -> RawPost | None:
     if not isinstance(item, Mapping):
         return None
-    post_id = item.get("id")
+    post_id = _safe_identifier(item.get("id"), max_length=32)
     author_id = item.get("author_id")
     text = item.get("text")
     created_at = item.get("created_at")

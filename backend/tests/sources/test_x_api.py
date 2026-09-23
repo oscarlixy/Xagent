@@ -132,6 +132,26 @@ def test_fetch_page_preserves_raw_count_and_head_before_item_rejection() -> None
     assert len(page.rejected_items) == 2
 
 
+def test_fetch_page_discards_unbounded_or_unsafe_rejection_identifiers() -> None:
+    long_identifier = "x" * 65
+    payload = {
+        "data": [{"id": long_identifier, "text": "missing fields"}],
+        "errors": [{"value": "provider detail must not persist"}],
+        "meta": {},
+    }
+    source, _tokens, client = _source(lambda _request: httpx.Response(200, json=payload))
+    try:
+        page = asyncio.run(
+            source.fetch_page(list_id=LIST_ID, pagination_token=None, max_results=10)
+        )
+    finally:
+        asyncio.run(client.aclose())
+
+    assert page.returned_count == 1
+    assert page.head_post_id is None
+    assert [item.identifier for item in page.rejected_items] == [None, None]
+
+
 def test_fetch_page_accepts_legacy_referenced_tweets_during_api_transition() -> None:
     payload = _response_payload()
     item = payload["data"][0]  # type: ignore[index]

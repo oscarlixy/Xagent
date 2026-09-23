@@ -193,8 +193,11 @@ def test_provider_rejections_remain_partial_through_pipeline_and_advance_safe_wa
         "posts_created": 1,
         "duplicates": 0,
         "rejected": 1,
+        "posts_returned": 2,
     }
     assert result.stages["ingestion"].last_error == "ingestion_partial"
+    assert result.stages["ingestion"].truncated is False
+    assert result.stages["ingestion"].stop_reason == "provider_exhausted"
     with session_factory() as session:
         run = session.get(SyncRun, result.run_id)
         x_list = session.get(XList, list_id)

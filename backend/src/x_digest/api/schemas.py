@@ -136,6 +136,14 @@ class StageResultResponse(StrictModel):
     counts: dict[str, int]
     duration_ms: int
     last_error: str | None = None
+    truncated: bool = False
+    stop_reason: Literal[
+        "unchanged",
+        "watermark_reached",
+        "time_window_reached",
+        "provider_exhausted",
+        "budget_exhausted",
+    ] | None = None
 
     @field_validator("last_error", mode="before")
     @classmethod

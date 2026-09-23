@@ -617,6 +617,7 @@ def test_rolled_back_page_does_not_inflate_durable_run_counts() -> None:
             0,
             0,
         )
+        assert run.posts_returned == 1
         assert x_list.latest_seen_at is None
         assert session.scalars(select(Post)).all() == []
 

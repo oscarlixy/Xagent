@@ -32,6 +32,8 @@ class StageResult:
     counts: dict[str, int]
     duration_ms: int
     last_error: str | None = None
+    truncated: bool = False
+    stop_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -76,9 +78,12 @@ class PipelineService:
                     "posts_created": sync.posts_created,
                     "duplicates": sync.duplicates,
                     "rejected": sync.rejected,
+                    "posts_returned": sync.posts_returned,
                 },
                 duration_ms=_elapsed_ms(ingestion_started),
                 last_error="ingestion_partial" if sync.status == "partial" else None,
+                truncated=sync.truncated,
+                stop_reason=sync.stop_reason,
             )
         }
         stages["processing"] = self._record_processing(list_id)
@@ -308,6 +313,8 @@ class PipelineService:
                         "counts": stage.counts,
                         "duration_ms": stage.duration_ms,
                         "error_code": stage.last_error,
+                        "truncated": stage.truncated,
+                        "stop_reason": stage.stop_reason,
                     }
                     for name, stage in stages.items()
                 }
@@ -323,6 +330,8 @@ class PipelineService:
                     "list_id": list_id,
                     "duration_ms": sum(stage.duration_ms for stage in result.stages.values()),
                     "counts": {name: stage.counts for name, stage in result.stages.items()},
+                    "truncated": result.stages["ingestion"].truncated,
+                    "stop_reason": result.stages["ingestion"].stop_reason,
                     "error_code": next(
                         (stage.last_error for stage in result.stages.values() if stage.last_error),
                         None,
