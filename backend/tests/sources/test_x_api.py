@@ -3,6 +3,7 @@ import importlib.util
 import io
 from collections.abc import Awaitable, Callable
 from contextlib import redirect_stdout
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -17,7 +18,7 @@ from x_digest.sources.errors import (
 from x_digest.sources.x_api import XApiSource
 
 LIST_ID = "123456789"
-API_URL = f"https://api.x.com/2/lists/{LIST_ID}/tweets"
+API_URL = "https://api.x.com/2/tweets/search/recent"
 SECRET = "test-oauth-access-token-must-not-leak"
 
 
@@ -44,7 +45,6 @@ def _response_payload() -> dict[str, object]:
                 "referenced_posts": [{"type": "reposted", "id": "original-1"}],
             }
         ],
-        "includes": {"users": [{"id": "author-1", "username": "alice", "name": "Alice"}]},
         "meta": {"next_token": "next-page"},
     }
 
@@ -54,6 +54,7 @@ def _source(
     *,
     sleeper: Callable[[float], Awaitable[None]] | None = None,
     max_attempts: int = 3,
+    source_mode: str = "recent_search",
 ) -> tuple[XApiSource, TokenService, httpx.AsyncClient]:
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     token_service = TokenService()
@@ -63,13 +64,41 @@ def _source(
             http_client=client,
             sleeper=sleeper,
             max_attempts=max_attempts,
+            source_mode=source_mode,
         ),
         token_service,
         client,
     )
 
 
-def test_fetch_page_uses_oauth_and_exact_list_query_without_repost_lookups() -> None:
+def test_list_posts_compatibility_mode_avoids_user_expansion() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=_response_payload())
+
+    source, _tokens, client = _source(handler, source_mode="list_posts")
+    try:
+        asyncio.run(source.fetch_page(list_id=LIST_ID, pagination_token=None, max_results=15))
+    finally:
+        asyncio.run(client.aclose())
+
+    assert str(requests[0].url.copy_with(query=None)) == (
+        f"https://api.x.com/2/lists/{LIST_ID}/tweets"
+    )
+    assert dict(requests[0].url.params) == {
+        "max_results": "15",
+        "post.fields": "author_id,created_at,conversation_id,entities,referenced_posts",
+    }
+
+
+def test_source_rejects_unknown_mode() -> None:
+    with pytest.raises(ValueError, match="source_mode"):
+        XApiSource(token_service=TokenService(), source_mode="typo")  # type: ignore[arg-type]
+
+
+def test_fetch_page_uses_recent_search_filters_without_user_expansion() -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -81,7 +110,10 @@ def test_fetch_page_uses_oauth_and_exact_list_query_without_repost_lookups() -> 
     try:
         page = asyncio.run(
             source.fetch_page(
-                list_id=LIST_ID, pagination_token="page-before", max_results=25
+                list_id=LIST_ID,
+                pagination_token="page-before",
+                max_results=25,
+                start_time=datetime(2026, 9, 22, 8, 30, tzinfo=UTC),
             )
         )
     finally:
@@ -93,9 +125,9 @@ def test_fetch_page_uses_oauth_and_exact_list_query_without_repost_lookups() -> 
     assert dict(requests[0].url.params) == {
         "max_results": "25",
         "pagination_token": "page-before",
+        "query": f"list:{LIST_ID} -is:retweet -is:reply -is:nullcast",
+        "start_time": "2026-09-22T08:30:00Z",
         "post.fields": "author_id,created_at,conversation_id,entities,referenced_posts",
-        "expansions": "author_id",
-        "user.fields": "username,name",
     }
     assert requests[0].headers["authorization"] == f"Bearer {SECRET}"
     assert page.next_token == "next-page"
@@ -103,9 +135,10 @@ def test_fetch_page_uses_oauth_and_exact_list_query_without_repost_lookups() -> 
     assert page.returned_count == 1
     assert page.head_post_id == "tweet-1"
     assert len(page.posts) == 1
-    assert page.posts[0].author.username == "alice"
+    assert page.posts[0].author.id == "author-1"
+    assert page.posts[0].author.username is None
     assert page.posts[0].references == [{"type": "reposted", "id": "original-1"}]
-    assert page.posts[0].source_url == "https://x.com/alice/status/tweet-1"
+    assert page.posts[0].source_url == "https://x.com/i/web/status/tweet-1"
 
 
 def test_fetch_page_preserves_raw_count_and_head_before_item_rejection() -> None:
@@ -114,7 +147,6 @@ def test_fetch_page_preserves_raw_count_and_head_before_item_rejection() -> None
             {"id": "bad-head", "text": "missing fields"},
             _response_payload()["data"][0],  # type: ignore[index]
         ],
-        "includes": _response_payload()["includes"],
         "errors": [{"value": "provider-error"}],
         "meta": {},
     }
@@ -159,7 +191,7 @@ def test_fetch_page_accepts_legacy_referenced_tweets_during_api_transition() -> 
     source, _tokens, client = _source(lambda _request: httpx.Response(200, json=payload))
     try:
         page = asyncio.run(
-            source.fetch_page(list_id=LIST_ID, pagination_token=None, max_results=1)
+            source.fetch_page(list_id=LIST_ID, pagination_token=None, max_results=10)
         )
     finally:
         asyncio.run(client.aclose())
@@ -176,7 +208,7 @@ def test_fetch_page_accepts_valid_data_and_converts_provider_item_errors_safely(
     source, _tokens, client = _source(lambda _request: httpx.Response(200, json=payload))
     try:
         page = asyncio.run(
-            source.fetch_page(list_id=LIST_ID, pagination_token=None, max_results=1)
+            source.fetch_page(list_id=LIST_ID, pagination_token=None, max_results=10)
         )
     finally:
         asyncio.run(client.aclose())
@@ -202,7 +234,7 @@ def test_fetch_page_accepts_omitted_data_with_safe_provider_item_errors() -> Non
     )
     try:
         page = asyncio.run(
-            source.fetch_page(list_id=LIST_ID, pagination_token=None, max_results=1)
+            source.fetch_page(list_id=LIST_ID, pagination_token=None, max_results=10)
         )
     finally:
         asyncio.run(client.aclose())
@@ -228,6 +260,22 @@ def test_fetch_page_rejects_non_numeric_list_ids_before_token_or_http_request(li
     assert token_service.calls == 0
 
 
+def test_recent_search_rejects_result_counts_below_provider_minimum() -> None:
+    def unexpected_request(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("an invalid result count must not make an X request")
+
+    source, token_service, client = _source(unexpected_request)
+    try:
+        with pytest.raises(InvalidRequestError):
+            asyncio.run(
+                source.fetch_page(list_id=LIST_ID, pagination_token=None, max_results=9)
+            )
+    finally:
+        asyncio.run(client.aclose())
+
+    assert token_service.calls == 0
+
+
 def test_fetch_page_rejects_malformed_provider_payload_without_body_details() -> None:
     source, _tokens, client = _source(
         lambda _request: httpx.Response(200, text='{"data": "bad ' + SECRET + '"}')
@@ -235,7 +283,7 @@ def test_fetch_page_rejects_malformed_provider_payload_without_body_details() ->
     try:
         with pytest.raises(InvalidResponseError) as raised:
             asyncio.run(
-                source.fetch_page(list_id=LIST_ID, pagination_token=None, max_results=1)
+                    source.fetch_page(list_id=LIST_ID, pagination_token=None, max_results=10)
             )
     finally:
         asyncio.run(client.aclose())
@@ -266,7 +314,7 @@ def test_fetch_page_retries_rate_limit_using_retry_after_and_preserves_request_i
     source, _tokens, client = _source(handler, sleeper=sleeper)
     try:
         page = asyncio.run(
-            source.fetch_page(list_id=LIST_ID, pagination_token=None, max_results=1)
+            source.fetch_page(list_id=LIST_ID, pagination_token=None, max_results=10)
         )
     finally:
         asyncio.run(client.aclose())
@@ -293,7 +341,7 @@ def test_fetch_page_uses_bounded_backoff_for_invalid_retry_after(retry_after: st
 
     source, _tokens, client = _source(handler, sleeper=sleeper)
     try:
-        asyncio.run(source.fetch_page(list_id=LIST_ID, pagination_token=None, max_results=1))
+        asyncio.run(source.fetch_page(list_id=LIST_ID, pagination_token=None, max_results=10))
     finally:
         asyncio.run(client.aclose())
 
@@ -316,7 +364,7 @@ def test_fetch_page_retries_5xx_with_bounded_exponential_backoff() -> None:
 
     source, _tokens, client = _source(handler, sleeper=sleeper)
     try:
-        asyncio.run(source.fetch_page(list_id=LIST_ID, pagination_token=None, max_results=1))
+        asyncio.run(source.fetch_page(list_id=LIST_ID, pagination_token=None, max_results=10))
     finally:
         asyncio.run(client.aclose())
 
@@ -331,7 +379,7 @@ def test_fetch_page_redacts_provider_body_after_retries_are_exhausted() -> None:
     try:
         with pytest.raises(UpstreamError) as raised:
             asyncio.run(
-                source.fetch_page(list_id=LIST_ID, pagination_token=None, max_results=1)
+                source.fetch_page(list_id=LIST_ID, pagination_token=None, max_results=10)
             )
     finally:
         asyncio.run(client.aclose())
@@ -353,7 +401,7 @@ def test_fetch_page_fails_authentication_without_retrying_or_leaking_body() -> N
     try:
         with pytest.raises(AuthenticationError) as raised:
             asyncio.run(
-                source.fetch_page(list_id=LIST_ID, pagination_token=None, max_results=1)
+                source.fetch_page(list_id=LIST_ID, pagination_token=None, max_results=10)
             )
     finally:
         asyncio.run(client.aclose())
@@ -364,7 +412,7 @@ def test_fetch_page_fails_authentication_without_retrying_or_leaking_body() -> N
     assert SECRET not in str(raised.value)
 
 
-def test_preflight_outputs_only_safe_json_and_uses_one_result(
+def test_preflight_outputs_only_safe_json_and_uses_provider_minimum(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     script = Path(__file__).parents[2] / "scripts" / "check_x_access.py"
@@ -406,7 +454,7 @@ def test_preflight_outputs_only_safe_json_and_uses_one_result(
     assert code == 0
     assert output.getvalue() == '{"status":"ok","count":0,"request_id":"request-only"}\n'
     assert SECRET not in output.getvalue()
-    assert probe_source.calls == [(LIST_ID, None, 1)]
+    assert probe_source.calls == [(LIST_ID, None, 10)]
 
 
 def test_preflight_passes_client_secret_to_oauth_client(

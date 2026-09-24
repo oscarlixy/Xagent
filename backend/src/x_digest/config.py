@@ -17,9 +17,11 @@ class Settings(BaseSettings):
     x_client_secret: SecretStr | None = None
     x_oauth_redirect_uri: AnyHttpUrl | None = None
     x_token_encryption_key: SecretStr | None = None
+    x_source_mode: Literal["recent_search", "list_posts"] = "recent_search"
     x_max_pages_per_sync: int = Field(default=6, ge=1, le=100)
-    x_max_posts_per_sync: int = Field(default=50, ge=1, le=10_000)
-    x_page_size: int = Field(default=10, ge=1, le=100)
+    x_max_posts_per_sync: int = Field(default=15, ge=1, le=10_000)
+    x_max_posts_per_day: int = Field(default=15, ge=1, le=10_000)
+    x_page_size: int = Field(default=15, ge=10, le=100)
     x_ingestion_backfill_hours: int = Field(default=24, ge=1, le=24 * 30)
     x_ingestion_overlap_minutes: int = Field(default=10, ge=0, le=1440)
     link_max_attempts: int = Field(default=3, ge=1, le=20)

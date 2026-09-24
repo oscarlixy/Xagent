@@ -30,7 +30,7 @@ def _build_source(settings: Settings) -> tuple[XApiSource, XOAuthClient]:
         redirect_uri=settings.x_oauth_redirect_uri,
         encryption_key=settings.x_token_encryption_key,
     )
-    return XApiSource(token_service=client), client
+    return XApiSource(token_service=client, source_mode=settings.x_source_mode), client
 
 
 async def _close(source: XApiSource, client: XOAuthClient) -> None:
@@ -43,7 +43,11 @@ async def _close(source: XApiSource, client: XOAuthClient) -> None:
 async def _probe(settings: Settings, list_id: str) -> SourcePage:
     source, client = _build_source(settings)
     try:
-        return await source.fetch_page(list_id=list_id, pagination_token=None, max_results=1)
+        return await source.fetch_page(
+            list_id=list_id,
+            pagination_token=None,
+            max_results=getattr(source, "minimum_results", 10),
+        )
     finally:
         await _close(source, client)
 

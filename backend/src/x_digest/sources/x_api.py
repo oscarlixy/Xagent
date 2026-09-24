@@ -5,7 +5,7 @@ import math
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import httpx
 
@@ -41,35 +41,61 @@ class XApiSource:
         sleeper: Sleeper | None = None,
         max_attempts: int = 3,
         api_base_url: str = DEFAULT_X_API_BASE_URL,
+        source_mode: Literal["recent_search", "list_posts"] = "recent_search",
     ) -> None:
         if max_attempts < 1:
             raise ValueError("max_attempts must be positive")
+        if source_mode not in {"recent_search", "list_posts"}:
+            raise ValueError("source_mode must be recent_search or list_posts")
         self._token_service = token_service
         self._http_client = http_client or httpx.AsyncClient(timeout=10.0)
         self._owns_http_client = http_client is None
         self._sleeper = sleeper or asyncio.sleep
         self._max_attempts = max_attempts
         self._api_base_url = api_base_url.rstrip("/")
+        self._source_mode = source_mode
 
     async def aclose(self) -> None:
         if self._owns_http_client:
             await self._http_client.aclose()
 
+    @property
+    def minimum_results(self) -> int:
+        return 10 if self._source_mode == "recent_search" else 1
+
     async def fetch_page(
-        self, *, list_id: str, pagination_token: str | None, max_results: int
+        self,
+        *,
+        list_id: str,
+        pagination_token: str | None,
+        max_results: int,
+        start_time: datetime | None = None,
     ) -> SourcePage:
-        if not is_valid_x_list_id(list_id) or not 1 <= max_results <= 100:
+        if (
+            not is_valid_x_list_id(list_id)
+            or not self.minimum_results <= max_results <= 100
+        ):
             raise InvalidRequestError()
         access_token = await self._token_service.access_token()
         params = {
             "max_results": str(max_results),
             "post.fields": "author_id,created_at,conversation_id,entities,referenced_posts",
-            "expansions": "author_id",
-            "user.fields": "username,name",
         }
         if pagination_token is not None:
             params["pagination_token"] = pagination_token
-        url = f"{self._api_base_url}/lists/{list_id}/tweets"
+        if self._source_mode == "recent_search":
+            params["query"] = f"list:{list_id} -is:retweet -is:reply -is:nullcast"
+        if start_time is not None and self._source_mode == "recent_search":
+            params["start_time"] = (
+                start_time.astimezone(UTC)
+                .isoformat(timespec="seconds")
+                .replace("+00:00", "Z")
+            )
+        url = (
+            f"{self._api_base_url}/tweets/search/recent"
+            if self._source_mode == "recent_search"
+            else f"{self._api_base_url}/lists/{list_id}/tweets"
+        )
 
         for attempt in range(self._max_attempts):
             try:
@@ -143,7 +169,6 @@ def _parse_page(response: httpx.Response, *, request_id: str | None) -> SourcePa
     first_item = data[0] if data else None
     raw_head = first_item.get("id") if isinstance(first_item, Mapping) else None
     head_post_id = _safe_identifier(raw_head, max_length=32)
-    users = _users_by_id(payload.get("includes"), request_id=request_id)
     errors = payload.get("errors", [])
     if not isinstance(errors, list):
         raise InvalidResponseError(request_id=request_id)
@@ -157,7 +182,7 @@ def _parse_page(response: httpx.Response, *, request_id: str | None) -> SourcePa
     posts: list[RawPost] = []
     rejected: list[RejectedItem] = []
     for item in data:
-        post = _parse_post(item, users)
+        post = _parse_post(item)
         if post is None:
             identifier = item.get("id") if isinstance(item, Mapping) else None
             rejected.append(
@@ -186,31 +211,7 @@ def _parse_page(response: httpx.Response, *, request_id: str | None) -> SourcePa
     )
 
 
-def _users_by_id(includes: object, *, request_id: str | None) -> dict[str, RawAuthor]:
-    if includes is None:
-        return {}
-    if not isinstance(includes, Mapping):
-        raise InvalidResponseError(request_id=request_id)
-    users = includes.get("users", [])
-    if not isinstance(users, list):
-        raise InvalidResponseError(request_id=request_id)
-    result: dict[str, RawAuthor] = {}
-    for user in users:
-        if not isinstance(user, Mapping):
-            continue
-        user_id = user.get("id")
-        username = user.get("username")
-        name = user.get("name")
-        if (
-            isinstance(user_id, str)
-            and isinstance(username, str)
-            and (name is None or isinstance(name, str))
-        ):
-            result[user_id] = RawAuthor(id=user_id, username=username, display_name=name)
-    return result
-
-
-def _parse_post(item: object, users: Mapping[str, RawAuthor]) -> RawPost | None:
+def _parse_post(item: object) -> RawPost | None:
     if not isinstance(item, Mapping):
         return None
     post_id = _safe_identifier(item.get("id"), max_length=32)
@@ -230,9 +231,7 @@ def _parse_post(item: object, users: Mapping[str, RawAuthor]) -> RawPost | None:
         and (references is None or isinstance(references, list))
     ):
         return None
-    author = users.get(author_id)
-    if author is None:
-        return None
+    author = RawAuthor(id=author_id)
     try:
         created = _parse_rfc3339(created_at)
     except ValueError:
@@ -247,7 +246,7 @@ def _parse_post(item: object, users: Mapping[str, RawAuthor]) -> RawPost | None:
         author=author,
         text=text,
         created_at=created,
-        source_url=f"https://x.com/{author.username}/status/{post_id}",
+        source_url=f"https://x.com/i/web/status/{post_id}",
         conversation_id=conversation_id,
         references=parsed_references,
         entities=entities,

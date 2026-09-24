@@ -14,8 +14,10 @@ TEST_TOKEN = SecretStr("test-only-internal-api-token-0123456789abcdef")
 
 def test_ingestion_cost_defaults_are_conservative() -> None:
     settings = Settings(_env_file=None)
-    assert settings.x_page_size == 10
-    assert settings.x_max_posts_per_sync == 50
+    assert settings.x_page_size == 15
+    assert settings.x_max_posts_per_sync == 15
+    assert settings.x_max_posts_per_day == 15
+    assert settings.x_source_mode == "recent_search"
     assert settings.x_max_pages_per_sync == 6
     assert settings.x_ingestion_backfill_hours == 24
     assert settings.x_ingestion_overlap_minutes == 10
@@ -38,10 +40,18 @@ def test_web_pipeline_receives_bounded_ingestion_settings(monkeypatch) -> None:
 
     assert {
         key: captured[key]
-        for key in ("page_size", "max_posts", "max_pages", "overlap", "backfill_window")
+        for key in (
+            "page_size",
+            "max_posts",
+            "max_posts_per_day",
+            "max_pages",
+            "overlap",
+            "backfill_window",
+        )
     } == {
-        "page_size": 10,
-        "max_posts": 50,
+        "page_size": 15,
+        "max_posts": 15,
+        "max_posts_per_day": 15,
         "max_pages": 6,
         "overlap": timedelta(minutes=10),
         "backfill_window": timedelta(hours=24),

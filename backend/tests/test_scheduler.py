@@ -64,10 +64,18 @@ def test_scheduler_pipeline_receives_bounded_ingestion_settings(monkeypatch) -> 
 
     assert {
         key: captured[key]
-        for key in ("page_size", "max_posts", "max_pages", "overlap", "backfill_window")
+        for key in (
+            "page_size",
+            "max_posts",
+            "max_posts_per_day",
+            "max_pages",
+            "overlap",
+            "backfill_window",
+        )
     } == {
-        "page_size": 10,
-        "max_posts": 50,
+        "page_size": 15,
+        "max_posts": 15,
+        "max_posts_per_day": 15,
         "max_pages": 6,
         "overlap": timedelta(minutes=10),
         "backfill_window": timedelta(hours=24),

@@ -14,6 +14,7 @@ from x_digest.api.auth import require_internal_token
 from x_digest.api.errors import APIError
 from x_digest.api.schemas import PipelineResultResponse, SummaryResponse
 from x_digest.models import Post, Summary, ThreadPost, XList
+from x_digest.repositories.jobs import ConcurrentSyncError
 from x_digest.services.pipeline import PipelineResult
 from x_digest.services.summarization import (
     NormalizedContent,
@@ -48,7 +49,14 @@ class JobService:
     async def sync(self, list_id: str) -> PipelineResult:
         if self._session.get(XList, list_id) is None:
             raise APIError(404, "list_not_found", "List not found")
-        return await self._pipeline.run_list_pipeline(list_id)
+        try:
+            return await self._pipeline.run_list_pipeline(list_id)
+        except ConcurrentSyncError:
+            raise APIError(
+                409,
+                "sync_already_running",
+                "A sync is already running for this List",
+            ) from None
 
     async def regenerate_summary(self, post_id: str, request_id: str) -> Summary:
         post = self._session.get(Post, post_id)
