@@ -28,6 +28,7 @@ from x_digest.models import (
     SyncRun,
     XList,
 )
+from x_digest.repositories.jobs import ConcurrentSyncError
 from x_digest.services.pipeline import PipelineResult, StageResult
 from x_digest.services.summarization import DeterministicSummarizer
 
@@ -54,6 +55,11 @@ class FakePipeline:
 class FailingPipeline:
     async def run_list_pipeline(self, list_id: str) -> PipelineResult:
         raise RuntimeError(f"provider secret for {list_id}")
+
+
+class ConcurrentPipeline:
+    async def run_list_pipeline(self, list_id: str) -> PipelineResult:
+        raise ConcurrentSyncError(f"Sync already running for List: {list_id}")
 
 
 class LeakyPipeline:
@@ -674,6 +680,16 @@ def test_unexpected_api_errors_never_expose_exception_text(api) -> None:
     assert response.json()["message"] == "Internal server error"
     assert response.json()["request_id"]
     assert "provider secret" not in str(response.json())
+
+
+def test_overlapping_sync_job_returns_conflict(api) -> None:
+    client, _factory, ids = api
+    client.app.state.pipeline_service = ConcurrentPipeline()
+
+    response = client.post(f"/api/jobs/sync/{ids['list']}", headers=AUTH)
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "sync_already_running"
 
 
 def test_unexpected_api_errors_are_logged_with_request_id(api, caplog) -> None:

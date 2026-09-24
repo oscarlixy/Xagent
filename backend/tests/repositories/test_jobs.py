@@ -60,6 +60,15 @@ def test_failed_run_advances_neither_cursor(session: Session) -> None:
     assert x_list.latest_seen_post_id is None
 
 
+def test_begin_sync_run_uses_explicit_utc_timestamp(session: Session) -> None:
+    x_list = upsert_list(session, platform_list_id="list-a", name="First")
+    started_at = datetime(2026, 9, 22, 23, 30, tzinfo=UTC)
+
+    run = begin_sync_run(session, list_id=x_list.id, started_at=started_at)
+
+    assert run.started_at == started_at
+
+
 def test_cursor_helper_never_moves_valid_watermark_backward(session: Session) -> None:
     stored_at = datetime(2026, 9, 23, tzinfo=UTC)
     x_list = upsert_list(session, platform_list_id="list-a", name="First")

@@ -314,7 +314,11 @@ def build_production_pipeline(
         encryption_key=settings.x_token_encryption_key,
         http_client=oauth_http_client,
     )
-    source = XApiSource(token_service=oauth_client, http_client=x_api_http_client)
+    source = XApiSource(
+        token_service=oauth_client,
+        http_client=x_api_http_client,
+        source_mode=settings.x_source_mode,
+    )
     return (
         PipelineService(
             ingestion=IngestionService(
@@ -322,6 +326,7 @@ def build_production_pipeline(
                 source=source,
                 max_pages=settings.x_max_pages_per_sync,
                 max_posts=settings.x_max_posts_per_sync,
+                max_posts_per_day=settings.x_max_posts_per_day,
                 page_size=settings.x_page_size,
                 overlap=timedelta(minutes=settings.x_ingestion_overlap_minutes),
                 backfill_window=timedelta(hours=settings.x_ingestion_backfill_hours),

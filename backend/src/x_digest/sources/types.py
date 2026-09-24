@@ -6,7 +6,7 @@ from typing import Any
 @dataclass(frozen=True)
 class RawAuthor:
     id: str
-    username: str
+    username: str | None = None
     display_name: str | None = None
 
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, UniqueConstraint
@@ -8,6 +8,16 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from x_digest.models.content import Digest
 from x_digest.models.source import Base, XList, new_id
+
+
+class SyncLease(Base):
+    __tablename__ = "sync_leases"
+
+    list_id: Mapped[str] = mapped_column(
+        ForeignKey("x_lists.id", ondelete="CASCADE"), primary_key=True
+    )
+    owner_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    acquired_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class SyncRun(Base):
@@ -22,11 +32,14 @@ class SyncRun(Base):
     duplicates: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     rejected: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     posts_returned: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    posts_reserved: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     truncated: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     stop_reason: Mapped[str | None] = mapped_column(String(64))
     error_code: Mapped[str | None] = mapped_column(String(128))
     debug_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON)
-    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.now)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     x_list: Mapped[XList] = relationship()

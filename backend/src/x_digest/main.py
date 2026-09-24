@@ -61,7 +61,11 @@ def create_app(
         http_client=oauth_http_client,
         clock=oauth_clock,
     )
-    x_source = XApiSource(token_service=x_oauth_client, http_client=x_api_http_client)
+    x_source = XApiSource(
+        token_service=x_oauth_client,
+        http_client=x_api_http_client,
+        source_mode=settings.x_source_mode,
+    )
     summarizer = build_summarizer(settings)
     digest_synthesizer = build_digest_synthesizer(settings)
     if pipeline_service is None:
@@ -71,6 +75,7 @@ def create_app(
                 source=x_source,
                 max_pages=settings.x_max_pages_per_sync,
                 max_posts=settings.x_max_posts_per_sync,
+                max_posts_per_day=settings.x_max_posts_per_day,
                 page_size=settings.x_page_size,
                 overlap=timedelta(minutes=settings.x_ingestion_overlap_minutes),
                 backfill_window=timedelta(hours=settings.x_ingestion_backfill_hours),

@@ -40,26 +40,34 @@ docker compose exec -T backend python -c "import urllib.request; print(urllib.re
 
 ## X access and incremental synchronization
 
-The source uses X's current List posts contract (`post.fields` and `referenced_posts`) while still
-accepting the legacy response field during transition. Before enabling scheduled collection, run an
-explicit, redacted one-item probe from the backend environment:
+The default source uses Recent Search with
+`list:LIST_ID -is:retweet -is:reply -is:nullcast`. X filters reposts, replies, and nullcast
+promotions before returning billable Post resources; quote Posts remain included. Requests carry the
+effective 24-hour/watermark boundary as `start_time`. Before enabling scheduled collection, run an
+explicit, redacted probe from the backend environment:
 
 ```bash
 cd backend
 uv run python scripts/check_x_access.py --list-id YOUR_NUMERIC_LIST_ID --confirm
 ```
 
-This real request can require a paid X API tier and appropriate List permissions. CI never calls X.
-Initialized Lists first perform a one-post unchanged probe. Changed or uninitialized Lists continue
-in pages of 10, never request more than 50 returned posts or six pages per run, and never backfill
-beyond 24 hours. Runs that exhaust a safety limit advance to the newest collected cursor and report
-`truncated=true` so the next run does not repurchase the same history. Individual rejected items make
-a run partial but no longer block cursor advancement.
+This real request can require a paid X API tier and appropriate List permissions. Recent Search has a
+minimum request size of 10, so the probe can return up to 10 billable Posts. CI never calls X. The
+production defaults request at most 15 returned Posts per run and enforce a cumulative limit of 15
+returned Posts per List per UTC day. They never backfill beyond 24 hours. Runs that exhaust a safety
+limit advance to the newest collected cursor and report `truncated=true` so the next run does not
+repurchase the same history. Individual rejected items make a run partial but no longer block cursor
+advancement.
 
-These limits can be configured in `backend/.env` with `X_PAGE_SIZE` (default 10),
-`X_MAX_POSTS_PER_SYNC` (50), `X_MAX_PAGES_PER_SYNC` (6),
-`X_INGESTION_BACKFILL_HOURS` (24), and `X_INGESTION_OVERLAP_MINUTES` (10). A smaller page-count
-override can truncate a run before it reaches the returned-post budget.
+Author expansions are not requested on each sync. Existing author names are reused from the local
+database; first-seen authors use their stable X user ID until their profile is populated separately.
+Post links use the username-independent `https://x.com/i/web/status/POST_ID` form.
+
+Configure the limits in `backend/.env` with `X_PAGE_SIZE` (default 15),
+`X_MAX_POSTS_PER_SYNC` (15), `X_MAX_POSTS_PER_DAY` (15), `X_MAX_PAGES_PER_SYNC` (6),
+`X_INGESTION_BACKFILL_HOURS` (24), and `X_INGESTION_OVERLAP_MINUTES` (10). If Recent Search does not
+cover a private List or protected member, set `X_SOURCE_MODE=list_posts` as an explicit compatibility
+fallback. The fallback still omits author expansions and remains subject to the same daily budget.
 
 Link fetches run outside database transactions. `LINK_MAX_ITEMS_PER_RUN`, `LINK_MAX_ATTEMPTS`, and
 `LINK_RETRY_BASE_SECONDS` bound each run and its exponential retries. Summary provider calls likewise

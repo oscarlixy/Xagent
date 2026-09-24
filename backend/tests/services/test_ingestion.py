@@ -5,7 +5,17 @@ import pytest
 from sqlalchemy import create_engine, delete, event, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from x_digest.models import Base, Post, PostListMembership, SyncRejection, SyncRun, XList
+from x_digest.models import (
+    Author,
+    Base,
+    Post,
+    PostListMembership,
+    SyncLease,
+    SyncRejection,
+    SyncRun,
+    XList,
+)
+from x_digest.repositories.jobs import ConcurrentSyncError
 from x_digest.repositories.lists import upsert_list
 from x_digest.services.ingestion import IngestionService
 from x_digest.services.oauth_client import OAuthClientError
@@ -58,6 +68,7 @@ def _service(
     max_pages: int = 6,
     max_posts: int = 50,
     page_size: int = 10,
+    max_posts_per_day: int = 10_000,
 ) -> IngestionService:
     return IngestionService(
         session_factory=factory,
@@ -65,6 +76,7 @@ def _service(
         max_pages=max_pages,
         max_posts=max_posts,
         page_size=page_size,
+        max_posts_per_day=max_posts_per_day,
         overlap=timedelta(minutes=10),
         backfill_window=timedelta(hours=24),
         clock=lambda: NOW,
@@ -76,14 +88,14 @@ def _stored_platform_ids(factory: sessionmaker[Session]) -> set[str]:
         return {post.platform_post_id for post in session.scalars(select(Post))}
 
 
-def test_initialized_unchanged_list_stops_after_one_result_probe() -> None:
+def test_initialized_unchanged_list_stops_after_first_search_page() -> None:
     factory, list_id = _new_list(
         observed_head="head", latest_seen_at=NOW - timedelta(hours=1)
     )
     source = FakeXSource({None: _page(_raw_post("head", NOW), head_post_id="head")})
     result = asyncio.run(_service(factory, source).sync_list(list_id))
 
-    assert [call[2] for call in source.calls] == [1]
+    assert [call[2] for call in source.calls] == [10]
     assert result.posts_returned == 1
     assert result.stop_reason == "unchanged"
     assert result.truncated is False
@@ -126,7 +138,7 @@ def test_incremental_thirty_posts_returns_at_most_forty_one_items() -> None:
     )
     result = asyncio.run(_service(factory, source).sync_list(list_id))
 
-    assert [call[2] for call in source.calls] == [1, 10, 10, 10]
+    assert [call[2] for call in source.calls] == [10, 10, 10, 10]
     assert result.posts_returned == 31
     assert result.posts_returned <= 41
     assert result.truncated is False
@@ -142,6 +154,255 @@ def test_remaining_budget_reduces_requested_page_size() -> None:
     asyncio.run(service.sync_list(list_id))
 
     assert [call[2] for call in source.calls] == [7]
+
+
+def test_cached_author_identity_is_reused_when_search_omits_user_expansion() -> None:
+    factory, list_id = _new_list()
+    with factory.begin() as session:
+        session.add(
+            Author(
+                platform_author_id="author-1",
+                username="alice",
+                display_name="Alice",
+            )
+        )
+    post = RawPost(
+        id="new",
+        author=RawAuthor(id="author-1"),
+        text="new post",
+        created_at=NOW,
+        source_url="https://x.com/i/web/status/new",
+    )
+
+    asyncio.run(_service(factory, FakeXSource({None: _page(post)})).sync_list(list_id))
+
+    with factory() as session:
+        author = session.scalar(select(Author).where(Author.platform_author_id == "author-1"))
+        stored = session.scalar(select(Post).where(Post.platform_post_id == "new"))
+        assert author is not None
+        assert author.username == "alice"
+        assert author.display_name == "Alice"
+        assert stored is not None
+        assert stored.source_url == "https://x.com/i/web/status/new"
+
+
+def test_daily_budget_is_shared_across_runs_and_stops_before_another_request() -> None:
+    factory, list_id = _new_list()
+    first_posts = tuple(_raw_post(f"first-{index}", NOW) for index in range(10))
+    first_source = FakeXSource({None: _page(*first_posts, returned_count=10)})
+    first = asyncio.run(
+        _service(factory, first_source, max_posts=50, max_posts_per_day=15).sync_list(list_id)
+    )
+
+    second_posts = tuple(_raw_post(f"second-{index}", NOW) for index in range(5))
+    second_source = FakeXSource({None: _page(*second_posts, returned_count=5)})
+    second = asyncio.run(
+        _service(factory, second_source, max_posts=50, max_posts_per_day=15).sync_list(list_id)
+    )
+
+    third_source = FakeXSource({None: _page(_raw_post("must-not-fetch", NOW))})
+    third = asyncio.run(
+        _service(factory, third_source, max_posts=50, max_posts_per_day=15).sync_list(list_id)
+    )
+
+    assert first.posts_returned == 10
+    assert [call[2] for call in second_source.calls] == [5]
+    assert second.posts_returned == 5
+    assert third_source.calls == []
+    assert third.posts_returned == 0
+    assert third.stop_reason == "daily_budget_exhausted"
+
+
+def test_sync_stops_before_request_when_remaining_budget_is_below_source_minimum() -> None:
+    factory, list_id = _new_list()
+    first_posts = tuple(_raw_post(f"first-{index}", NOW) for index in range(10))
+    asyncio.run(
+        _service(
+            factory,
+            FakeXSource({None: _page(*first_posts, returned_count=10)}),
+            max_posts_per_day=15,
+        ).sync_list(list_id)
+    )
+
+    source = FakeXSource({None: _page(_raw_post("must-not-fetch", NOW))})
+    source.minimum_results = 10
+    result = asyncio.run(
+        _service(factory, source, max_posts_per_day=15).sync_list(list_id)
+    )
+
+    assert source.calls == []
+    assert result.stop_reason == "daily_budget_exhausted"
+
+
+def test_underfilled_page_does_not_trigger_below_minimum_followup_request() -> None:
+    factory, list_id = _new_list()
+    posts = tuple(_raw_post(f"post-{index}", NOW) for index in range(8))
+    source = FakeXSource(
+        {
+            None: _page(*posts, next_token="p2", returned_count=8),
+            "p2": _page(_raw_post("must-not-fetch", NOW)),
+        }
+    )
+    source.minimum_results = 10
+
+    result = asyncio.run(
+        _service(
+            factory,
+            source,
+            max_posts=15,
+            max_posts_per_day=15,
+            page_size=15,
+        ).sync_list(list_id)
+    )
+
+    assert [call[1] for call in source.calls] == [None]
+    assert result.posts_returned == 8
+    assert result.truncated is True
+    assert result.stop_reason == "budget_exhausted"
+
+
+def test_overlapping_sync_for_same_list_is_rejected_before_second_source_call() -> None:
+    factory, list_id = _new_list()
+
+    class BlockingSource:
+        minimum_results = 1
+
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.calls = 0
+
+        async def fetch_page(
+            self,
+            *,
+            list_id: str,
+            pagination_token: str | None,
+            max_results: int,
+            start_time: datetime | None = None,
+        ) -> SourcePage:
+            self.calls += 1
+            self.started.set()
+            await self.release.wait()
+            return SourcePage()
+
+    async def scenario() -> tuple[int, int]:
+        first_source = BlockingSource()
+        second_source = FakeXSource({None: SourcePage()})
+        first_task = asyncio.create_task(_service(factory, first_source).sync_list(list_id))
+        await first_source.started.wait()
+        try:
+            with pytest.raises(RuntimeError, match="already running"):
+                await _service(factory, second_source).sync_list(list_id)
+        finally:
+            first_source.release.set()
+            await first_task
+        return first_source.calls, len(second_source.calls)
+
+    first_calls, second_calls = asyncio.run(scenario())
+
+    assert first_calls == 1
+    assert second_calls == 0
+
+
+def test_sync_that_loses_lease_stops_before_next_source_request() -> None:
+    factory, list_id = _new_list()
+
+    class LeaseTakeoverSource:
+        minimum_results = 1
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def fetch_page(
+            self,
+            *,
+            list_id: str,
+            pagination_token: str | None,
+            max_results: int,
+            start_time: datetime | None = None,
+        ) -> SourcePage:
+            self.calls += 1
+            if self.calls > 1:
+                raise AssertionError("lost lease must stop before another X request")
+            with factory.begin() as session:
+                lease = session.scalar(select(SyncLease))
+                assert lease is not None
+                lease.owner_id = "replacement-owner"
+                lease.acquired_at = NOW + timedelta(hours=2)
+            return _page(
+                _raw_post("first", NOW),
+                next_token="p2",
+                returned_count=1,
+            )
+
+    source = LeaseTakeoverSource()
+
+    with pytest.raises(ConcurrentSyncError, match="lease"):
+        asyncio.run(_service(factory, source).sync_list(list_id))
+
+    assert source.calls == 1
+
+
+def test_in_flight_request_reserves_daily_budget_before_stale_lease_takeover() -> None:
+    factory, list_id = _new_list()
+    internal_list_id = list_id
+    takeover_source = FakeXSource(
+        {
+            None: _page(
+                *tuple(_raw_post(f"takeover-{index}", NOW) for index in range(15)),
+                returned_count=15,
+            )
+        }
+    )
+
+    class TakeoverDuringRequestSource:
+        minimum_results = 10
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.takeover_result = None
+
+        async def fetch_page(
+            self,
+            *,
+            list_id: str,
+            pagination_token: str | None,
+            max_results: int,
+            start_time: datetime | None = None,
+        ) -> SourcePage:
+            self.calls += 1
+            with factory.begin() as session:
+                lease = session.scalar(select(SyncLease))
+                assert lease is not None
+                lease.acquired_at = NOW - timedelta(hours=2)
+            self.takeover_result = await _service(
+                factory,
+                takeover_source,
+                max_posts=15,
+                page_size=15,
+                max_posts_per_day=15,
+            ).sync_list(internal_list_id)
+            return _page(
+                *tuple(_raw_post(f"original-{index}", NOW) for index in range(15)),
+                returned_count=15,
+            )
+
+    source = TakeoverDuringRequestSource()
+    result = asyncio.run(
+        _service(
+            factory,
+            source,
+            max_posts=15,
+            page_size=15,
+            max_posts_per_day=15,
+        ).sync_list(list_id)
+    )
+
+    assert result.posts_returned == 15
+    assert source.calls == 1
+    assert takeover_source.calls == []
+    assert source.takeover_result is not None
+    assert source.takeover_result.stop_reason == "daily_budget_exhausted"
 
 
 def test_mixed_page_crossing_recent_watermark_does_not_fetch_next_page() -> None:
@@ -409,7 +670,12 @@ def test_source_fetch_happens_outside_an_active_database_transaction() -> None:
 
     class TransactionAwareSource:
         async def fetch_page(
-            self, *, list_id: str, pagination_token: str | None, max_results: int
+            self,
+            *,
+            list_id: str,
+            pagination_token: str | None,
+            max_results: int,
+            start_time: datetime | None = None,
         ) -> SourcePage:
             assert list_id == "123456789"
             assert active_transactions == 0
@@ -437,7 +703,12 @@ def test_cancelled_second_page_retains_rows_but_advances_no_cursors() -> None:
         calls = 0
 
         async def fetch_page(
-            self, *, list_id: str, pagination_token: str | None, max_results: int
+            self,
+            *,
+            list_id: str,
+            pagination_token: str | None,
+            max_results: int,
+            start_time: datetime | None = None,
         ) -> SourcePage:
             self.calls += 1
             if self.calls == 1:
@@ -481,7 +752,12 @@ def test_second_page_failure_retains_rows_but_advances_no_cursors() -> None:
         calls = 0
 
         async def fetch_page(
-            self, *, list_id: str, pagination_token: str | None, max_results: int
+            self,
+            *,
+            list_id: str,
+            pagination_token: str | None,
+            max_results: int,
+            start_time: datetime | None = None,
         ) -> SourcePage:
             self.calls += 1
             if self.calls == 1:
@@ -544,7 +820,12 @@ def test_failed_source_persists_only_safe_error_codes(
 
     class FailingSource:
         async def fetch_page(
-            self, *, list_id: str, pagination_token: str | None, max_results: int
+            self,
+            *,
+            list_id: str,
+            pagination_token: str | None,
+            max_results: int,
+            start_time: datetime | None = None,
         ) -> SourcePage:
             raise error
 
@@ -578,7 +859,9 @@ def test_rolled_back_page_does_not_inflate_durable_run_counts() -> None:
     def fail_page_commit(*_args: object) -> None:
         nonlocal commits
         commits += 1
-        if commits == 3:
+        # Lease acquisition, stale-run reconciliation, the run row, and lease renewal
+        # commit before the first fetched page transaction.
+        if commits == 5:
             raise RuntimeError("forced page commit rollback")
 
     event.listen(engine, "commit", fail_page_commit)

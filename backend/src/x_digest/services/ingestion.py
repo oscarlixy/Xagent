@@ -4,11 +4,20 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from x_digest.models import SyncRejection, SyncRun, XList
-from x_digest.repositories.jobs import advance_list_cursors, begin_sync_run, finish_sync_run
+from x_digest.models import Author, SyncRejection, SyncRun, XList
+from x_digest.repositories.jobs import (
+    acquire_sync_lease,
+    advance_list_cursors,
+    begin_sync_run,
+    finish_sync_run,
+    release_sync_lease,
+    renew_sync_lease,
+    reserve_sync_post_budget,
+    settle_sync_post_budget,
+)
 from x_digest.repositories.posts import AuthorInput, PostInput, attach_to_list, upsert_post
 from x_digest.services.oauth_client import OAuthClientError
 from x_digest.sources.base import XSource
@@ -42,6 +51,7 @@ StopReason = Literal[
     "time_window_reached",
     "provider_exhausted",
     "budget_exhausted",
+    "daily_budget_exhausted",
 ]
 Clock = Callable[[], datetime]
 
@@ -68,6 +78,7 @@ class IngestionService:
         source: XSource,
         max_pages: int = 6,
         max_posts: int = 50,
+        max_posts_per_day: int = 10_000,
         page_size: int = 10,
         overlap: timedelta = timedelta(minutes=10),
         backfill_window: timedelta = timedelta(hours=24),
@@ -77,6 +88,8 @@ class IngestionService:
             raise ValueError("max_pages must be positive")
         if max_posts <= 0:
             raise ValueError("max_posts must be positive")
+        if max_posts_per_day <= 0:
+            raise ValueError("max_posts_per_day must be positive")
         if not 1 <= page_size <= 100:
             raise ValueError("page_size must be between 1 and 100")
         if overlap < timedelta(0):
@@ -87,12 +100,33 @@ class IngestionService:
         self._source = source
         self._max_pages = max_pages
         self._max_posts = max_posts
+        self._max_posts_per_day = max_posts_per_day
         self._page_size = page_size
         self._overlap = overlap
         self._backfill_window = backfill_window
         self._clock = clock or (lambda: datetime.now(UTC))
 
     async def sync_list(self, list_id: str) -> SyncResult:
+        run_now = _as_utc(self._clock())
+        with self._session_factory.begin() as session:
+            lease_owner = acquire_sync_lease(
+                session,
+                list_id=list_id,
+                acquired_at=run_now,
+            )
+        try:
+            return await self._sync_list_locked(
+                list_id,
+                run_now=run_now,
+                lease_owner=lease_owner,
+            )
+        finally:
+            with self._session_factory.begin() as session:
+                release_sync_lease(session, list_id=list_id, owner_id=lease_owner)
+
+    async def _sync_list_locked(
+        self, list_id: str, *, run_now: datetime, lease_owner: str
+    ) -> SyncResult:
         with self._session_factory() as session:
             x_list = session.get(XList, list_id)
             if x_list is None:
@@ -100,7 +134,17 @@ class IngestionService:
             platform_list_id = x_list.platform_list_id
             stored_head = x_list.latest_observed_post_id
             initialized = stored_head is not None
-            run_now = _as_utc(self._clock())
+            day_start = run_now.replace(hour=0, minute=0, second=0, microsecond=0)
+            posts_returned_today = session.scalar(
+                select(func.coalesce(func.sum(SyncRun.posts_reserved), 0)).where(
+                    SyncRun.list_id == list_id,
+                    SyncRun.started_at >= day_start,
+                    SyncRun.started_at < day_start + timedelta(days=1),
+                )
+            )
+            daily_remaining = max(
+                self._max_posts_per_day - int(posts_returned_today or 0), 0
+            )
             recovery_cutoff = run_now - self._backfill_window
             watermark_cutoff = (
                 _as_utc(x_list.latest_seen_at) - self._overlap
@@ -116,26 +160,57 @@ class IngestionService:
 
         self._reconcile_stale_runs(list_id)
         with self._session_factory.begin() as session:
-            sync_run = begin_sync_run(session, list_id=list_id)
+            sync_run = begin_sync_run(session, list_id=list_id, started_at=run_now)
             run_id = sync_run.id
 
         result = _MutableSyncResult(run_id=run_id)
+        if daily_remaining == 0:
+            result.stop_reason = "daily_budget_exhausted"
+            return self._complete_run(list_id, result)
+        effective_max_posts = min(self._max_posts, daily_remaining)
+        minimum_results = getattr(self._source, "minimum_results", 1)
+        if effective_max_posts < minimum_results:
+            result.stop_reason = "daily_budget_exhausted"
+            return self._complete_run(list_id, result)
         pagination_token: str | None = None
         try:
             while (
                 result.pages_fetched < self._max_pages
-                and result.posts_returned < self._max_posts
+                and result.posts_returned < effective_max_posts
             ):
                 first_page = result.pages_fetched == 0
-                first_request_size = 1 if initialized else self._page_size
                 request_size = min(
-                    first_request_size if first_page else self._page_size,
-                    self._max_posts - result.posts_returned,
+                    self._page_size,
+                    effective_max_posts - result.posts_returned,
                 )
+                if request_size < minimum_results:
+                    result.stop_reason = "budget_exhausted"
+                    result.truncated = True
+                    break
+                with self._session_factory.begin() as session:
+                    renew_sync_lease(
+                        session,
+                        list_id=list_id,
+                        owner_id=lease_owner,
+                        renewed_at=_as_utc(self._clock()),
+                    )
+                    reserved_request_size = reserve_sync_post_budget(
+                        session,
+                        list_id=list_id,
+                        sync_run_id=run_id,
+                        day_start=day_start,
+                        requested=request_size,
+                        minimum=minimum_results,
+                        daily_limit=self._max_posts_per_day,
+                    )
+                if reserved_request_size == 0:
+                    result.stop_reason = "daily_budget_exhausted"
+                    break
                 page = await self._source.fetch_page(
                     list_id=platform_list_id,
                     pagination_token=pagination_token,
-                    max_results=request_size,
+                    max_results=reserved_request_size,
+                    start_time=effective_cutoff,
                 )
                 returned_count = (
                     page.returned_count
@@ -168,6 +243,12 @@ class IngestionService:
                     candidate = _merge_results(result, page_result)
                     durable_run = session.get(SyncRun, run_id)
                     if durable_run is not None:  # pragma: no branch - the run was just created
+                        settle_sync_post_budget(
+                            session,
+                            sync_run=durable_run,
+                            reserved=reserved_request_size,
+                            returned=returned_count,
+                        )
                         for rejected in page.rejected_items:
                             session.add(
                                 SyncRejection(
@@ -185,7 +266,7 @@ class IngestionService:
                 elif page.next_token is None or returned_count == 0:
                     result.stop_reason = "provider_exhausted"
                 elif (
-                    result.posts_returned >= self._max_posts
+                    result.posts_returned >= effective_max_posts
                     or result.pages_fetched >= self._max_pages
                 ):
                     result.stop_reason = "budget_exhausted"
@@ -291,14 +372,25 @@ class IngestionService:
     def _store_post(
         session: Session, x_list: XList, raw_post: RawPost, result: "_MutableSyncResult"
     ) -> None:
+        cached_author = session.scalar(
+            select(Author).where(Author.platform_author_id == raw_post.author.id)
+        )
+        username = raw_post.author.username or (
+            cached_author.username if cached_author is not None else raw_post.author.id
+        )
+        display_name = (
+            raw_post.author.display_name
+            if raw_post.author.display_name is not None
+            else cached_author.display_name if cached_author is not None else None
+        )
         post, created = upsert_post(
             session,
             PostInput(
                 platform_post_id=raw_post.id,
                 author=AuthorInput(
                     platform_author_id=raw_post.author.id,
-                    username=raw_post.author.username,
-                    display_name=raw_post.author.display_name,
+                    username=username,
+                    display_name=display_name,
                 ),
                 text=raw_post.text,
                 created_at=raw_post.created_at,

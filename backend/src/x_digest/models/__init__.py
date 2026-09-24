@@ -1,5 +1,5 @@
 from x_digest.models.content import Digest, DigestItem, Link, PostState, Summary, Thread, ThreadPost
-from x_digest.models.jobs import NotificationDelivery, SyncRejection, SyncRun
+from x_digest.models.jobs import NotificationDelivery, SyncLease, SyncRejection, SyncRun
 from x_digest.models.oauth import OAuthCredential
 from x_digest.models.source import Author, Base, Post, PostListMembership, XList
 
@@ -16,6 +16,7 @@ __all__ = [
     "PostState",
     "Summary",
     "SyncRejection",
+    "SyncLease",
     "SyncRun",
     "Thread",
     "ThreadPost",
